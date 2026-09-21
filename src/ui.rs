@@ -1409,6 +1409,7 @@ impl App {
         });
         if self.secondary.is_none() {
             self.focused = 0;
+            self.editors[1].attach(&self.documents[self.primary].handle);
         }
         self.refresh_views()?;
         self.json_document = None;
@@ -2298,7 +2299,35 @@ impl App {
     }
 
     fn close(&mut self) -> Result<()> {
-        self.recovery.flush(self.revision + 1, self.snapshot()?)?;
+        // The flush blocks on a full recovery write; leave the reason on the status bar
+        // so the dialog below (which pumps the main loop) renders it if anything fails.
+        self.note("Saving recovery before exit...");
+        let saved = self
+            .snapshot()
+            .and_then(|snapshot| self.recovery.flush(self.revision + 1, snapshot));
+        if let Err(error) = saved {
+            self.recovery_error = Some(error.clone());
+            self.update_status();
+            let unsaved = self
+                .documents
+                .iter()
+                .filter(|doc| doc.snapshot.dirty)
+                .count();
+            if message(
+                Some(&self.window),
+                &format!(
+                    "Recovery could not be saved: {error}\n\nQuit anyway? {unsaved} tab(s) with unsaved edits will be lost.\nChoose Cancel to stay open and save them with File > Save as."
+                ),
+                gtk::MessageType::Error,
+                &[
+                    ("_Cancel", gtk::ResponseType::Cancel),
+                    ("_Quit anyway", gtk::ResponseType::Yes),
+                ],
+            ) != gtk::ResponseType::Yes
+            {
+                return Ok(());
+            }
+        }
         self.exiting = true;
         self.window.hide();
         unsafe {
@@ -2500,16 +2529,29 @@ impl App {
                 }
             }
             Event::Uris(text) => {
+                let mut failures = Vec::new();
                 for uri in text
                     .lines()
                     .map(str::trim)
                     .filter(|line| !line.is_empty() && !line.starts_with('#'))
                 {
                     let file = gio::File::for_uri(uri);
-                    let path = file
-                        .path()
-                        .ok_or_else(|| format!("Only local file drops are supported: {uri}"))?;
-                    self.open_path(&path, None)?;
+                    match file.path() {
+                        Some(path) => {
+                            if let Err(error) = self.open_path(&path, None) {
+                                failures.push(error);
+                            }
+                        }
+                        None => {
+                            failures.push(format!("Only local file drops are supported: {uri}"))
+                        }
+                    }
+                }
+                if let Some(first) = failures.first() {
+                    return Err(match failures.len() {
+                        1 => first.clone(),
+                        count => format!("{first} ({} more file(s) also failed.)", count - 1),
+                    });
                 }
             }
             Event::Map(y) => {

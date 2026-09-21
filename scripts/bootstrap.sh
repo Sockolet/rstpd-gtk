@@ -17,12 +17,25 @@ A0C0CDF1CF226DC6252020CE9A87A939A8B615E65269DB40AC9123B28FA20A9D  vendor/scintil
 84D7DBE9D9CEB34961AD6FBDCF91A24F7CC1A2FD59D1851C0F5F4A0CDBFDE2F9  vendor/scite566.zip
 CHECKSUMS
 
-if [[ ! -d vendor/scintilla ]]; then
-    unzip -q vendor/scintilla566.zip -d vendor
-fi
-if [[ ! -d vendor/lexilla ]]; then
-    unzip -q vendor/lexilla553.zip -d vendor
-fi
+extract() {
+    local name="$1" archive="$2" hash="$3"
+    local destination="vendor/$name"
+    local stamp="$destination/.rstpd-source-hash"
+    # Re-extract when an existing tree was not produced by this exact archive:
+    # verifying the zip says nothing about a stale or locally modified checkout.
+    if [[ -d "$destination" ]] && { [[ ! -f "$stamp" ]] || [[ "$(cat "$stamp")" != "$hash" ]]; }; then
+        rm -rf "$destination"
+    fi
+    if [[ ! -d "$destination" ]]; then
+        unzip -q "$archive" -d vendor
+        printf '%s\n' "$hash" >"$stamp"
+    fi
+}
+
+extract scintilla vendor/scintilla566.zip \
+    A0C0CDF1CF226DC6252020CE9A87A939A8B615E65269DB40AC9123B28FA20A9D
+extract lexilla vendor/lexilla553.zip \
+    2092B1DD18355321717E3BDE25148E4C87E691723CA2B06A65E29A307C5462A6
 mkdir -p vendor/language-data
 unzip -oqj vendor/scite566.zip 'scite/src/*.properties' 'scite/License.txt' \
     -d vendor/language-data
