@@ -15,7 +15,7 @@ jobs:
     name: Build and test on Linux
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # xvfb is required because the GUI tests create real GTK windows.
       - name: Install GTK3 and build tools

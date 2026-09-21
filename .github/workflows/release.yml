@@ -15,7 +15,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install GTK3 and build tools
         run: |
@@ -50,8 +50,7 @@ jobs:
         id: package
         run: |
           set -euo pipefail
-          version="$(cargo metadata --no-deps --format-version 1 \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
           name="rstpd-${version}-linux-x86_64"
           mkdir -p "dist/${name}/share/applications" "dist/${name}/licenses"
           cp target/release/rstpd "dist/${name}/"
