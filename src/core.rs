@@ -18,6 +18,71 @@ pub struct Highlight {
     pub strikes: Vec<Range<usize>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "EditorFontData")]
+pub struct EditorFont {
+    family: String,
+    size_hundredths: u32,
+}
+
+#[derive(Deserialize)]
+struct EditorFontData {
+    family: String,
+    size_hundredths: u32,
+}
+
+impl EditorFont {
+    pub const MIN_SIZE_HUNDREDTHS: u32 = 400;
+    pub const MAX_SIZE_HUNDREDTHS: u32 = 7200;
+
+    pub fn new(family: impl Into<String>, size_hundredths: u32) -> Result<Self> {
+        let family = family.into();
+        if family.trim().is_empty() || family.len() > 128 || family.chars().any(char::is_control) {
+            return Err(
+                "Choose a font family of at most 128 UTF-8 bytes without control characters."
+                    .into(),
+            );
+        }
+        if !(Self::MIN_SIZE_HUNDREDTHS..=Self::MAX_SIZE_HUNDREDTHS).contains(&size_hundredths) {
+            return Err("Editor font size must be between 4 and 72 points.".into());
+        }
+        Ok(Self {
+            family,
+            size_hundredths,
+        })
+    }
+
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+
+    pub fn size_hundredths(&self) -> u32 {
+        self.size_hundredths
+    }
+}
+
+impl Default for EditorFont {
+    fn default() -> Self {
+        Self {
+            family: if cfg!(windows) {
+                "Consolas"
+            } else {
+                "Monospace"
+            }
+            .into(),
+            size_hundredths: 1100,
+        }
+    }
+}
+
+impl TryFrom<EditorFontData> for EditorFont {
+    type Error = String;
+
+    fn try_from(data: EditorFontData) -> Result<Self> {
+        Self::new(data.family, data.size_hundredths)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Encoding {
     #[default]
@@ -253,95 +318,154 @@ fn code_page(label: &str) -> Option<u32> {
     }
 }
 fn decode_code_page(bytes: &[u8], codepage: u32) -> Result<String> {
-    if bytes.is_empty() {
-        return Ok(String::new());
-    }
-    use windows_sys::Win32::Globalization::{MB_ERR_INVALID_CHARS, MultiByteToWideChar};
-    let len = i32::try_from(bytes.len()).map_err(|_| "Encoded input is too large.")?;
-    unsafe {
-        let count = MultiByteToWideChar(
-            codepage,
-            MB_ERR_INVALID_CHARS,
-            bytes.as_ptr(),
-            len,
-            std::ptr::null_mut(),
-            0,
-        );
-        if count == 0 {
-            return Err(format!(
-                "Cannot decode code page {codepage}: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let mut chars = vec![0u16; count as usize];
-        if MultiByteToWideChar(
-            codepage,
-            MB_ERR_INVALID_CHARS,
-            bytes.as_ptr(),
-            len,
-            chars.as_mut_ptr(),
-            count,
-        ) != count
-        {
-            return Err(format!(
-                "Code-page decoding failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        String::from_utf16(&chars).map_err(|e| format!("Decoded text is invalid: {e}"))
-    }
+    let table = code_page_table(codepage)?;
+    Ok(bytes
+        .iter()
+        .map(|&byte| match table {
+            Some(table) if byte >= 0x80 => table[usize::from(byte - 0x80)],
+            _ => char::from(byte),
+        })
+        .collect())
 }
 fn encode_code_page(text: &str, codepage: u32) -> Result<Vec<u8>> {
-    if text.is_empty() {
-        return Ok(Vec::new());
-    }
-    use windows_sys::Win32::Globalization::{WC_NO_BEST_FIT_CHARS, WideCharToMultiByte};
-    let chars: Vec<_> = text.encode_utf16().collect();
-    let len = i32::try_from(chars.len()).map_err(|_| "Text is too large.")?;
-    unsafe {
-        let mut substituted = 0;
-        let count = WideCharToMultiByte(
-            codepage,
-            WC_NO_BEST_FIT_CHARS,
-            chars.as_ptr(),
-            len,
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null(),
-            &mut substituted,
-        );
-        if count == 0 {
-            return Err(format!(
-                "Cannot encode code page {codepage}: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let mut bytes = vec![0; count as usize];
-        if WideCharToMultiByte(
-            codepage,
-            WC_NO_BEST_FIT_CHARS,
-            chars.as_ptr(),
-            len,
-            bytes.as_mut_ptr(),
-            count,
-            std::ptr::null(),
-            &mut substituted,
-        ) != count
-        {
-            return Err(format!(
-                "Code-page encoding failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        if substituted != 0 {
-            return Err(
-                "This encoding cannot represent every character. Use Unicode to avoid data loss."
-                    .into(),
-            );
-        }
-        Ok(bytes)
+    let table = code_page_table(codepage)?;
+    text.chars()
+        .map(|ch| {
+            let byte = match table {
+                Some(_) if ch.is_ascii() => Some(ch as u8),
+                Some(table) => table
+                    .iter()
+                    .position(|&mapped| mapped == ch)
+                    .map(|index| 0x80 + index as u8),
+                None => u8::try_from(u32::from(ch)).ok(),
+            };
+            byte.ok_or_else(|| {
+                format!(
+                    "Code page {codepage} cannot represent U+{:04X}. Use Unicode to avoid data loss.",
+                    u32::from(ch)
+                )
+            })
+        })
+        .collect()
+}
+fn code_page_table(codepage: u32) -> Result<Option<&'static [char; 128]>> {
+    match codepage {
+        437 => Ok(Some(&CP437_HIGH)),
+        850 => Ok(Some(&CP850_HIGH)),
+        852 => Ok(Some(&CP852_HIGH)),
+        866 => Ok(Some(&CP866_HIGH)),
+        // ISO-8859-1 includes C1 controls; encoding_rs's WHATWG label selects Windows-1252.
+        28591 => Ok(None),
+        _ => Err(format!("Unknown code page: {codepage}")),
     }
 }
+
+// Microsoft OEM mappings, table version 2.00, 1996-04-24:
+// https://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/PC/CP{437,850,852,866}.TXT
+// Bytes 0x00..0x7f map identically; these tables contain bytes 0x80..0xff.
+//
+// UNICODE LICENSE V3
+// Copyright (c) 1991-2026 Unicode, Inc.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of data files and any associated documentation (the "Data Files") or
+// software and any associated documentation (the "Software") to deal in the
+// Data Files or Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, and/or sell
+// copies of the Data Files or Software, and to permit persons to whom the
+// Data Files or Software are furnished to do so, provided that either (a)
+// this copyright and permission notice appear with all copies of the Data
+// Files or Software, or (b) this copyright and permission notice appear in
+// associated Documentation.
+//
+// THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+// KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+// THIRD PARTY RIGHTS.
+//
+// IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
+// BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
+// OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+// WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+// ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
+// FILES OR SOFTWARE.
+//
+// Except as contained in this notice, the name of a copyright holder shall
+// not be used in advertising or otherwise to promote the sale, use or other
+// dealings in these Data Files or Software without prior written
+// authorization of the copyright holder.
+const CP437_HIGH: [char; 128] = [
+    '\u{00c7}', '\u{00fc}', '\u{00e9}', '\u{00e2}', '\u{00e4}', '\u{00e0}', '\u{00e5}', '\u{00e7}',
+    '\u{00ea}', '\u{00eb}', '\u{00e8}', '\u{00ef}', '\u{00ee}', '\u{00ec}', '\u{00c4}', '\u{00c5}',
+    '\u{00c9}', '\u{00e6}', '\u{00c6}', '\u{00f4}', '\u{00f6}', '\u{00f2}', '\u{00fb}', '\u{00f9}',
+    '\u{00ff}', '\u{00d6}', '\u{00dc}', '\u{00a2}', '\u{00a3}', '\u{00a5}', '\u{20a7}', '\u{0192}',
+    '\u{00e1}', '\u{00ed}', '\u{00f3}', '\u{00fa}', '\u{00f1}', '\u{00d1}', '\u{00aa}', '\u{00ba}',
+    '\u{00bf}', '\u{2310}', '\u{00ac}', '\u{00bd}', '\u{00bc}', '\u{00a1}', '\u{00ab}', '\u{00bb}',
+    '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{2561}', '\u{2562}', '\u{2556}',
+    '\u{2555}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255d}', '\u{255c}', '\u{255b}', '\u{2510}',
+    '\u{2514}', '\u{2534}', '\u{252c}', '\u{251c}', '\u{2500}', '\u{253c}', '\u{255e}', '\u{255f}',
+    '\u{255a}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256c}', '\u{2567}',
+    '\u{2568}', '\u{2564}', '\u{2565}', '\u{2559}', '\u{2558}', '\u{2552}', '\u{2553}', '\u{256b}',
+    '\u{256a}', '\u{2518}', '\u{250c}', '\u{2588}', '\u{2584}', '\u{258c}', '\u{2590}', '\u{2580}',
+    '\u{03b1}', '\u{00df}', '\u{0393}', '\u{03c0}', '\u{03a3}', '\u{03c3}', '\u{00b5}', '\u{03c4}',
+    '\u{03a6}', '\u{0398}', '\u{03a9}', '\u{03b4}', '\u{221e}', '\u{03c6}', '\u{03b5}', '\u{2229}',
+    '\u{2261}', '\u{00b1}', '\u{2265}', '\u{2264}', '\u{2320}', '\u{2321}', '\u{00f7}', '\u{2248}',
+    '\u{00b0}', '\u{2219}', '\u{00b7}', '\u{221a}', '\u{207f}', '\u{00b2}', '\u{25a0}', '\u{00a0}',
+];
+const CP850_HIGH: [char; 128] = [
+    '\u{00c7}', '\u{00fc}', '\u{00e9}', '\u{00e2}', '\u{00e4}', '\u{00e0}', '\u{00e5}', '\u{00e7}',
+    '\u{00ea}', '\u{00eb}', '\u{00e8}', '\u{00ef}', '\u{00ee}', '\u{00ec}', '\u{00c4}', '\u{00c5}',
+    '\u{00c9}', '\u{00e6}', '\u{00c6}', '\u{00f4}', '\u{00f6}', '\u{00f2}', '\u{00fb}', '\u{00f9}',
+    '\u{00ff}', '\u{00d6}', '\u{00dc}', '\u{00f8}', '\u{00a3}', '\u{00d8}', '\u{00d7}', '\u{0192}',
+    '\u{00e1}', '\u{00ed}', '\u{00f3}', '\u{00fa}', '\u{00f1}', '\u{00d1}', '\u{00aa}', '\u{00ba}',
+    '\u{00bf}', '\u{00ae}', '\u{00ac}', '\u{00bd}', '\u{00bc}', '\u{00a1}', '\u{00ab}', '\u{00bb}',
+    '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{00c1}', '\u{00c2}', '\u{00c0}',
+    '\u{00a9}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255d}', '\u{00a2}', '\u{00a5}', '\u{2510}',
+    '\u{2514}', '\u{2534}', '\u{252c}', '\u{251c}', '\u{2500}', '\u{253c}', '\u{00e3}', '\u{00c3}',
+    '\u{255a}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256c}', '\u{00a4}',
+    '\u{00f0}', '\u{00d0}', '\u{00ca}', '\u{00cb}', '\u{00c8}', '\u{0131}', '\u{00cd}', '\u{00ce}',
+    '\u{00cf}', '\u{2518}', '\u{250c}', '\u{2588}', '\u{2584}', '\u{00a6}', '\u{00cc}', '\u{2580}',
+    '\u{00d3}', '\u{00df}', '\u{00d4}', '\u{00d2}', '\u{00f5}', '\u{00d5}', '\u{00b5}', '\u{00fe}',
+    '\u{00de}', '\u{00da}', '\u{00db}', '\u{00d9}', '\u{00fd}', '\u{00dd}', '\u{00af}', '\u{00b4}',
+    '\u{00ad}', '\u{00b1}', '\u{2017}', '\u{00be}', '\u{00b6}', '\u{00a7}', '\u{00f7}', '\u{00b8}',
+    '\u{00b0}', '\u{00a8}', '\u{00b7}', '\u{00b9}', '\u{00b3}', '\u{00b2}', '\u{25a0}', '\u{00a0}',
+];
+const CP852_HIGH: [char; 128] = [
+    '\u{00c7}', '\u{00fc}', '\u{00e9}', '\u{00e2}', '\u{00e4}', '\u{016f}', '\u{0107}', '\u{00e7}',
+    '\u{0142}', '\u{00eb}', '\u{0150}', '\u{0151}', '\u{00ee}', '\u{0179}', '\u{00c4}', '\u{0106}',
+    '\u{00c9}', '\u{0139}', '\u{013a}', '\u{00f4}', '\u{00f6}', '\u{013d}', '\u{013e}', '\u{015a}',
+    '\u{015b}', '\u{00d6}', '\u{00dc}', '\u{0164}', '\u{0165}', '\u{0141}', '\u{00d7}', '\u{010d}',
+    '\u{00e1}', '\u{00ed}', '\u{00f3}', '\u{00fa}', '\u{0104}', '\u{0105}', '\u{017d}', '\u{017e}',
+    '\u{0118}', '\u{0119}', '\u{00ac}', '\u{017a}', '\u{010c}', '\u{015f}', '\u{00ab}', '\u{00bb}',
+    '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{00c1}', '\u{00c2}', '\u{011a}',
+    '\u{015e}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255d}', '\u{017b}', '\u{017c}', '\u{2510}',
+    '\u{2514}', '\u{2534}', '\u{252c}', '\u{251c}', '\u{2500}', '\u{253c}', '\u{0102}', '\u{0103}',
+    '\u{255a}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256c}', '\u{00a4}',
+    '\u{0111}', '\u{0110}', '\u{010e}', '\u{00cb}', '\u{010f}', '\u{0147}', '\u{00cd}', '\u{00ce}',
+    '\u{011b}', '\u{2518}', '\u{250c}', '\u{2588}', '\u{2584}', '\u{0162}', '\u{016e}', '\u{2580}',
+    '\u{00d3}', '\u{00df}', '\u{00d4}', '\u{0143}', '\u{0144}', '\u{0148}', '\u{0160}', '\u{0161}',
+    '\u{0154}', '\u{00da}', '\u{0155}', '\u{0170}', '\u{00fd}', '\u{00dd}', '\u{0163}', '\u{00b4}',
+    '\u{00ad}', '\u{02dd}', '\u{02db}', '\u{02c7}', '\u{02d8}', '\u{00a7}', '\u{00f7}', '\u{00b8}',
+    '\u{00b0}', '\u{00a8}', '\u{02d9}', '\u{0171}', '\u{0158}', '\u{0159}', '\u{25a0}', '\u{00a0}',
+];
+const CP866_HIGH: [char; 128] = [
+    '\u{0410}', '\u{0411}', '\u{0412}', '\u{0413}', '\u{0414}', '\u{0415}', '\u{0416}', '\u{0417}',
+    '\u{0418}', '\u{0419}', '\u{041a}', '\u{041b}', '\u{041c}', '\u{041d}', '\u{041e}', '\u{041f}',
+    '\u{0420}', '\u{0421}', '\u{0422}', '\u{0423}', '\u{0424}', '\u{0425}', '\u{0426}', '\u{0427}',
+    '\u{0428}', '\u{0429}', '\u{042a}', '\u{042b}', '\u{042c}', '\u{042d}', '\u{042e}', '\u{042f}',
+    '\u{0430}', '\u{0431}', '\u{0432}', '\u{0433}', '\u{0434}', '\u{0435}', '\u{0436}', '\u{0437}',
+    '\u{0438}', '\u{0439}', '\u{043a}', '\u{043b}', '\u{043c}', '\u{043d}', '\u{043e}', '\u{043f}',
+    '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{2561}', '\u{2562}', '\u{2556}',
+    '\u{2555}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255d}', '\u{255c}', '\u{255b}', '\u{2510}',
+    '\u{2514}', '\u{2534}', '\u{252c}', '\u{251c}', '\u{2500}', '\u{253c}', '\u{255e}', '\u{255f}',
+    '\u{255a}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256c}', '\u{2567}',
+    '\u{2568}', '\u{2564}', '\u{2565}', '\u{2559}', '\u{2558}', '\u{2552}', '\u{2553}', '\u{256b}',
+    '\u{256a}', '\u{2518}', '\u{250c}', '\u{2588}', '\u{2584}', '\u{258c}', '\u{2590}', '\u{2580}',
+    '\u{0440}', '\u{0441}', '\u{0442}', '\u{0443}', '\u{0444}', '\u{0445}', '\u{0446}', '\u{0447}',
+    '\u{0448}', '\u{0449}', '\u{044a}', '\u{044b}', '\u{044c}', '\u{044d}', '\u{044e}', '\u{044f}',
+    '\u{0401}', '\u{0451}', '\u{0404}', '\u{0454}', '\u{0407}', '\u{0457}', '\u{040e}', '\u{045e}',
+    '\u{00b0}', '\u{2219}', '\u{00b7}', '\u{221a}', '\u{2116}', '\u{00a4}', '\u{25a0}', '\u{00a0}',
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Eol {
@@ -1158,6 +1282,58 @@ pub fn format_json(text: &str, compact: bool, eol: Eol) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_font_is_validated_and_round_trips_fractional_points() {
+        let font = EditorFont::new("DejaVu Sans Mono", 1250).unwrap();
+        assert_eq!(font.family(), "DejaVu Sans Mono");
+        assert_eq!(font.size_hundredths(), 1250);
+        let json = serde_json::to_value(&font).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"family":"DejaVu Sans Mono","size_hundredths":1250})
+        );
+        assert_eq!(serde_json::from_value::<EditorFont>(json).unwrap(), font);
+        for size in [
+            EditorFont::MIN_SIZE_HUNDREDTHS,
+            EditorFont::MAX_SIZE_HUNDREDTHS,
+        ] {
+            assert!(EditorFont::new("Monospace", size).is_ok());
+        }
+        for size in [
+            0,
+            EditorFont::MIN_SIZE_HUNDREDTHS - 1,
+            EditorFont::MAX_SIZE_HUNDREDTHS + 1,
+            u32::MAX,
+        ] {
+            assert!(EditorFont::new("Monospace", size).is_err());
+            assert!(
+                serde_json::from_value::<EditorFont>(
+                    serde_json::json!({"family":"Monospace","size_hundredths":size})
+                )
+                .is_err()
+            );
+        }
+        for family in ["", "   ", "Mono\0space", "Mono\nspace", &"f".repeat(129)] {
+            assert!(EditorFont::new(family, 1100).is_err());
+            assert!(
+                serde_json::from_value::<EditorFont>(
+                    serde_json::json!({"family":family,"size_hundredths":1100})
+                )
+                .is_err()
+            );
+        }
+        assert!(EditorFont::new("f".repeat(128), 1100).is_ok());
+        assert!(
+            EditorFont::new(
+                "\u{6e90}\u{30ce}\u{89d2}\u{30b4}\u{30b7}\u{30c3}\u{30af}",
+                1100
+            )
+            .is_ok()
+        );
+        assert_eq!(EditorFont::default().size_hundredths(), 1100);
+    }
+
     #[test]
     fn unicode_encodings_round_trip() {
         for encoding in [
@@ -1401,6 +1577,85 @@ mod tests {
         let latin = Encoding::Legacy("iso-8859-1".into());
         assert!(latin.encode("\u{20ac}").is_err());
         assert!(decode(&[255, 254, 0, 0, 0, 216, 0, 0], None).is_err());
+    }
+    #[test]
+    fn portable_code_pages_round_trip_every_byte() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        for label in ["IBM437", "IBM850", "IBM852", "IBM866", "iso-8859-1"] {
+            let encoding = Encoding::Legacy(label.into());
+            let (text, detected) = decode(&bytes, Some(&encoding)).unwrap();
+            assert_eq!(detected, encoding);
+            assert_eq!(text.chars().count(), 256, "{label}");
+            assert_eq!(encoding.encode(&text).unwrap(), bytes, "{label}");
+            for byte in &bytes {
+                let text = decode(&[*byte], Some(&encoding)).unwrap().0;
+                assert_eq!(encoding.encode(&text).unwrap(), [*byte], "{label}");
+            }
+            assert_eq!(decode(&[], Some(&encoding)).unwrap().0, "");
+            assert!(encoding.encode("").unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn portable_code_pages_match_standard_character_fixtures() {
+        for (label, bytes, text) in [
+            (
+                "IBM437",
+                &[0x82, 0x9e, 0xb3, 0xdb, 0xe0, 0xf0][..],
+                "\u{e9}\u{20a7}\u{2502}\u{2588}\u{3b1}\u{2261}",
+            ),
+            (
+                "IBM850",
+                &[0x9b, 0x9d, 0xb5, 0xc6, 0xd5, 0xf2][..],
+                "\u{f8}\u{d8}\u{c1}\u{e3}\u{131}\u{2017}",
+            ),
+            (
+                "IBM852",
+                &[0x88, 0xa4, 0xa8, 0xc7, 0xd8, 0xfd][..],
+                "\u{142}\u{104}\u{118}\u{103}\u{11b}\u{159}",
+            ),
+            (
+                "IBM866",
+                &[0x80, 0xaf, 0xe0, 0xf0, 0xf2, 0xfc][..],
+                "\u{410}\u{43f}\u{440}\u{401}\u{404}\u{2116}",
+            ),
+            (
+                "iso-8859-1",
+                &[0x80, 0x91, 0x9f, 0xa0, 0xe9, 0xff][..],
+                "\u{80}\u{91}\u{9f}\u{a0}\u{e9}\u{ff}",
+            ),
+        ] {
+            let encoding = Encoding::Legacy(label.into());
+            assert_eq!(decode(bytes, Some(&encoding)).unwrap().0, text, "{label}");
+            assert_eq!(encoding.encode(text).unwrap(), bytes, "{label}");
+        }
+    }
+    #[test]
+    fn portable_code_pages_reject_unrepresentable_and_best_fit_characters() {
+        for label in ["IBM437", "IBM850", "IBM852", "IBM866", "iso-8859-1"] {
+            let encoding = Encoding::Legacy(label.into());
+            for text in ["\u{20ac}", "\u{1f680}", "\u{ff21}", "e\u{301}", "\u{2014}"] {
+                assert!(encoding.encode(text).is_err(), "{label}: {text:?}");
+            }
+        }
+    }
+    #[test]
+    fn listed_iso_encodings_do_not_select_other_character_sets() {
+        for encoding in encoding_options() {
+            let label = encoding.label();
+            if label.starts_with("iso-8859-") && label != "iso-8859-1" {
+                assert!(
+                    encoding_rs::Encoding::for_label(label.as_bytes())
+                        .unwrap()
+                        .name()
+                        .eq_ignore_ascii_case(label),
+                    "{label}"
+                );
+            }
+        }
+        let latin = Encoding::Legacy("iso-8859-1".into());
+        let windows = Encoding::Legacy("windows-1252".into());
+        assert_eq!(decode(&[0x80], Some(&latin)).unwrap().0, "\u{80}");
+        assert_eq!(decode(&[0x80], Some(&windows)).unwrap().0, "\u{20ac}");
     }
     #[test]
     fn json5_tree_keeps_original_spans_with_unicode_whitespace_and_comments() {

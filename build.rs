@@ -197,12 +197,11 @@ fn language_data() {
     println!("cargo:rerun-if-changed=vendor/lexilla/include/SciLexer.h");
 }
 
-fn sources(build: &mut cc::Build, directory: &str, exclude: &str) {
+fn sources(build: &mut cc::Build, directory: &str) {
     let mut files: Vec<_> = fs::read_dir(directory)
-        .unwrap_or_else(|e| panic!("{directory}: {e}. Run .\\scripts\\bootstrap.ps1 first."))
+        .unwrap_or_else(|e| panic!("{directory}: {e}. Run ./scripts/bootstrap.sh first."))
         .map(|e| e.expect("source entry").path())
         .filter(|p| p.extension().is_some_and(|e| e == "cxx"))
-        .filter(|p| p.file_name().is_some_and(|n| n != exclude))
         .collect();
     files.sort();
     build.files(files);
@@ -210,12 +209,17 @@ fn sources(build: &mut cc::Build, directory: &str, exclude: &str) {
 }
 
 fn main() {
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        panic!("rstpd requires Windows and the MSVC toolchain.");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+        panic!("This rstpd port requires Linux and GTK3.");
     }
+    let gtk = pkg_config::Config::new()
+        .cargo_metadata(false)
+        .atleast_version("3.22")
+        .probe("gtk+-3.0")
+        .expect("GTK3 development files are required (pkg-config gtk+-3.0).");
     language_data();
     let header = fs::read_to_string("vendor/scintilla/include/Scintilla.h")
-        .expect("Run .\\scripts\\bootstrap.ps1 to unpack the pinned editor sources.");
+        .expect("Run ./scripts/bootstrap.sh to unpack the pinned editor sources.");
     let mut constants = String::from("// Generated from the vendored Scintilla public header.\n");
     for line in header.lines() {
         let words: Vec<_> = line.split_whitespace().collect();
@@ -275,47 +279,54 @@ fn main() {
     .expect("write Scintilla constants");
     println!("cargo:rerun-if-changed=vendor/scintilla/include/Scintilla.h");
     println!("cargo:rerun-if-changed=vendor/scintilla/include/Scintilla.iface");
+    println!("cargo:rerun-if-changed=vendor/scintilla/include");
+    println!("cargo:rerun-if-changed=vendor/lexilla/include");
     println!("cargo:rerun-if-changed=src/native_bridge.cxx");
 
     let mut sci = cc::Build::new();
     sci.cpp(true)
         .std("c++17")
-        .static_crt(true)
+        .pic(true)
         .warnings(false)
-        .flag("/utf-8")
-        .flag("/EHsc")
-        .flag("/guard:cf")
+        .define("GTK", None)
         .define("NDEBUG", None)
         .define("NO_CXX11_REGEX", None)
         .file("src/native_bridge.cxx")
+        .includes(&gtk.include_paths)
         .include("vendor/scintilla/include")
         .include("vendor/scintilla/src");
-    sources(&mut sci, "vendor/scintilla/src", "");
-    sources(&mut sci, "vendor/scintilla/win32", "ScintillaDLL.cxx");
+    for (name, value) in &gtk.defines {
+        sci.define(name, value.as_deref());
+    }
+    sources(&mut sci, "vendor/scintilla/src");
+    sources(&mut sci, "vendor/scintilla/gtk");
     sci.compile("scintilla");
+
+    cc::Build::new()
+        .pic(true)
+        .warnings(false)
+        .includes(&gtk.include_paths)
+        .file("vendor/scintilla/gtk/scintilla-marshal.c")
+        .compile("scintilla_marshal");
 
     let mut lex = cc::Build::new();
     lex.cpp(true)
         .std("c++17")
-        .static_crt(true)
+        .pic(true)
         .warnings(false)
-        .flag("/utf-8")
-        .flag("/EHsc")
-        .flag("/guard:cf")
         .define("LEXILLA_NO_EXPORT", None)
         .define("NDEBUG", None)
         .include("vendor/scintilla/include")
         .include("vendor/lexilla/include")
         .include("vendor/lexilla/lexlib")
         .file("vendor/lexilla/src/Lexilla.cxx");
-    sources(&mut lex, "vendor/lexilla/lexlib", "");
-    sources(&mut lex, "vendor/lexilla/lexers", "");
+    sources(&mut lex, "vendor/lexilla/lexlib");
+    sources(&mut lex, "vendor/lexilla/lexers");
     lex.compile("lexilla");
-    for lib in ["imm32", "ole32", "oleaut32", "gdi32", "user32", "advapi32"] {
-        println!("cargo:rustc-link-lib={lib}");
-    }
-    embed_resource::compile("assets/app.rc", embed_resource::NONE)
-        .manifest_required()
-        .expect("compile application manifest");
-    println!("cargo:rerun-if-changed=assets");
+
+    pkg_config::Config::new()
+        .atleast_version("3.22")
+        .probe("gtk+-3.0")
+        .expect("link GTK3");
+    pkg_config::probe_library("gmodule-no-export-2.0").expect("link GLib modules");
 }

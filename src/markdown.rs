@@ -205,7 +205,7 @@ mod tests {
     use super::*;
     #[test]
     fn common_markdown_constructs_have_semantic_styles() {
-        let text = include_str!("..\\tests\\fixtures\\highlighting.md");
+        let text = include_str!("../tests/fixtures/highlighting.md");
         let output = highlight(text).unwrap();
         for (needle, style) in [
             ("visible heading", 6),

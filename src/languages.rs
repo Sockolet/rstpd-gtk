@@ -2,7 +2,7 @@ use crate::udl::UserLanguage;
 use std::{path::Path, sync::Arc};
 
 include!(concat!(env!("OUT_DIR"), "/language_data.rs"));
-pub const COVERAGE: &str = include_str!("..\\assets\\language-coverage.tsv");
+pub const COVERAGE: &str = include_str!("../assets/language-coverage.tsv");
 
 #[derive(Clone, Debug)]
 pub struct Language {
@@ -434,10 +434,9 @@ mod tests {
             .into_iter()
             .map(|group| (group.label, group.indices))
             .collect();
-        let definition =
-            crate::udl::import(include_str!("..\\tests\\fixtures\\custom-language.xml"))
-                .unwrap()
-                .remove(0);
+        let definition = crate::udl::import(include_str!("../tests/fixtures/custom-language.xml"))
+            .unwrap()
+            .remove(0);
         let first = add_custom(&mut languages, definition.clone()).unwrap();
         let mut second = definition;
         second.name = "Aardvark custom".into();

@@ -1,15 +1,11 @@
-#![cfg(windows)]
+use gtk::prelude::*;
 use rstpd::{
     editor::{self, Editor, Palette, sci::*},
     languages,
 };
-use std::{
-    path::Path,
-    ptr::{null, null_mut},
-};
-use windows_sys::Win32::{System::LibraryLoader::GetModuleHandleW, UI::WindowsAndMessaging::*};
+use std::path::Path;
 
-fn color_at(editor: Editor, text: &str, needle: &str) -> isize {
+fn color_at(editor: &Editor, text: &str, needle: &str) -> isize {
     let position = text.find(needle).unwrap();
     let style = editor.send(SCI_GETSTYLEAT, position, 0) as usize;
     editor.send(SCI_STYLEGETFORE, style, 0)
@@ -18,31 +14,21 @@ fn color_at(editor: Editor, text: &str, needle: &str) -> isize {
 #[test]
 fn markdown_has_visible_syntax_in_both_themes() {
     unsafe {
-        let instance = GetModuleHandleW(null());
-        editor::register(instance).unwrap();
-        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
-        let parent = CreateWindowExW(
-            0,
-            class.as_ptr(),
-            null(),
-            WS_OVERLAPPED,
-            0,
-            0,
-            900,
-            700,
-            null_mut(),
-            null_mut(),
-            instance,
-            null_mut(),
-        );
-        assert!(!parent.is_null());
-        let editor = Editor::new(parent, instance, 101, false).unwrap();
+        gtk::init().expect("GTK3 requires a display; run this test under xvfb-run when headless.");
+        let parent = gtk::Window::new(gtk::WindowType::Toplevel);
+        parent.set_default_size(900, 700);
+        let editor = Editor::new().unwrap();
+        parent.add(editor.widget());
+        parent.show_all();
+        while gtk::events_pending() {
+            gtk::main_iteration_do(false);
+        }
         let document = editor.create_document().unwrap();
         editor.attach(&document);
         let catalog = languages::catalog(&editor::available_lexers());
         let language = &catalog[languages::detect(Path::new("highlighting.md"), &catalog)];
         assert_eq!(language.name, "Markdown");
-        let text = include_str!("fixtures\\highlighting.md");
+        let text = include_str!("fixtures/highlighting.md");
         editor.set_text(text).unwrap();
         for dark in [false, true] {
             editor.language(language, Palette::new(dark)).unwrap();
@@ -58,13 +44,13 @@ fn markdown_has_visible_syntax_in_both_themes() {
                 "The Markdown lexer should distinguish headings from body text."
             );
             assert_ne!(
-                color_at(editor, text, "# A"),
-                color_at(editor, text, "Plain body"),
+                color_at(&editor, text, "# A"),
+                color_at(&editor, text, "Plain body"),
                 "Recognized Markdown headings must not render in the same color as body text."
             );
             assert_ne!(
-                color_at(editor, text, "visible heading"),
-                color_at(editor, text, "Plain body"),
+                color_at(&editor, text, "visible heading"),
+                color_at(&editor, text, "Plain body"),
                 "Heading text, not just the # marker, must be highlighted."
             );
             let bold = editor.send(SCI_GETSTYLEAT, text.find("bold words").unwrap(), 0) as usize;
@@ -73,12 +59,12 @@ fn markdown_has_visible_syntax_in_both_themes() {
                 editor.send(SCI_GETSTYLEAT, text.find("italic words").unwrap(), 0) as usize;
             assert_ne!(editor.send(SCI_STYLEGETITALIC, italic, 0), 0);
             assert_ne!(
-                color_at(editor, text, "inline_code"),
-                color_at(editor, text, "Plain body")
+                color_at(&editor, text, "inline_code"),
+                color_at(&editor, text, "Plain body")
             );
             assert_ne!(
-                color_at(editor, text, "fn example"),
-                color_at(editor, text, "Plain body")
+                color_at(&editor, text, "fn example"),
+                color_at(&editor, text, "Plain body")
             );
             assert_ne!(
                 editor.send(
@@ -114,7 +100,7 @@ fn markdown_has_visible_syntax_in_both_themes() {
                 editor.send(SCI_COLOURISE, 0, -1);
                 let mut colors = std::collections::HashSet::new();
                 for needle in &needles {
-                    let color = color_at(editor, text, needle);
+                    let color = color_at(&editor, text, needle);
                     assert_ne!(
                         color, palette.background as isize,
                         "Invisible token {needle} in {path}"
@@ -131,6 +117,6 @@ fn markdown_has_visible_syntax_in_both_themes() {
                 );
             }
         }
-        DestroyWindow(parent);
+        parent.destroy();
     }
 }

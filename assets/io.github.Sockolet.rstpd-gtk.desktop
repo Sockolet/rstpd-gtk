@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=rstpd
+Comment=Native text editor with split views, comparison and recovery
+Exec=rstpd %F
+Icon=text-x-generic
+Terminal=false
+StartupNotify=true
+Categories=Utility;TextEditor;GTK;
+MimeType=text/plain;text/markdown;application/json;

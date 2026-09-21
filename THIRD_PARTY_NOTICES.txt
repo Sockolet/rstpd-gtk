@@ -15,7 +15,7 @@ Only editor component sources and language data are used. No Notepad++
 application code, plugin code, or SciTE application code is incorporated.
 The source archives retain their original per-file notices.
 
-assets\language-coverage.tsv records factual language names and file extensions
+assets/language-coverage.tsv records factual language names and file extensions
 from the Notepad++ language inventory (model date 20260714). It does not
 incorporate Notepad++ lexer or application implementations.
 
@@ -54,20 +54,23 @@ OR PERFORMANCE OF THIS SOFTWARE.
 Rust dependencies
 -----------------
 The exact versions and registry checksums are recorded in Cargo.lock.
-scripts\build.ps1 copies dependency redistribution notices into the portable
-package's licenses directory, along with dependencies.json (name, version,
-and declared SPDX license). This includes build-time dependencies for
-completeness; not all packages in that inventory are part of the runtime.
+The GTK3 Rust bindings are distributed under the MIT license. Retain the
+applicable dependency licenses when redistributing binaries; the Linux build
+script builds locally and does not create a redistribution bundle.
+
+GTK3 and related GLib, Pango, Cairo and system libraries are dynamically linked,
+not bundled by this repository. Their licenses and notices are supplied by
+the Linux distribution's packages. GTK3 and GLib use the GNU LGPL.
 
 Toolbar icons
 -------------
-The eight toolbar icons are native-vector adaptations of Lucide artwork,
+The Linux toolbar uses the system GTK symbolic icon theme. No Lucide artwork
+is embedded in the Linux executable.
+
+The upstream Windows toolbar's eight native-vector icons were adaptations of Lucide artwork,
 pinned to revision 951813ce76a859d4d8b145366972cbb237147a4e.
 Lucide is distributed under ISC, with an additional MIT notice for its
 Feather-derived subset. The complete notices and individual icon provenance
-are in assets\icons in the source tree and licenses\lucide-icons in the
-portable package.
+are retained in assets/icons in the source tree.
 
-Rust itself is distributed under the MIT and Apache-2.0 licenses. Windows
-system libraries and the Microsoft C/C++ runtime are subject to their
-respective Microsoft licenses.
+Rust itself is distributed under the MIT and Apache-2.0 licenses.

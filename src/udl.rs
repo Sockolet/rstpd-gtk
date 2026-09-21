@@ -735,7 +735,7 @@ pub fn highlight(language: &UserLanguage, text: &str) -> Result<Highlight> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    const XML: &str = include_str!("..\\tests\\fixtures\\custom-language.xml");
+    const XML: &str = include_str!("../tests/fixtures/custom-language.xml");
     #[test]
     fn imports_and_styles_keywords_comments_strings_and_folds() {
         let language = import(XML).unwrap().remove(0);

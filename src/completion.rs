@@ -43,7 +43,7 @@ fn language_key(language: &str) -> &str {
 fn builtins() -> &'static [Api] {
     static APIS: OnceLock<Vec<Api>> = OnceLock::new();
     APIS.get_or_init(|| {
-        include_str!("..\\assets\\completion.api")
+        include_str!("../assets/completion.api")
             .lines()
             .map(|line| {
                 let parts: Vec<_> = line.splitn(3, '|').collect();

@@ -1,18 +1,22 @@
 use crate::{
-    core::{MAX_DOCUMENT_BYTES, Result},
+    core::{EditorFont, MAX_DOCUMENT_BYTES, Result},
     languages::{self, Language},
     syntax::{self, Role},
 };
+use gtk::{
+    glib::{
+        self,
+        translate::{ToGlibPtr, from_glib_none},
+    },
+    prelude::*,
+};
 use std::{
-    ffi::{CString, c_void},
+    cell::Cell,
+    ffi::{CString, c_char, c_void},
     marker::PhantomData,
     ops::Range,
-    ptr::{NonNull, null_mut},
+    ptr::NonNull,
     rc::Rc,
-};
-use windows_sys::Win32::{
-    Foundation::{HINSTANCE, HWND},
-    UI::{Input::KeyboardAndMouse::SetFocus, WindowsAndMessaging::*},
 };
 
 #[allow(dead_code)]
@@ -22,22 +26,49 @@ pub mod sci {
 use sci::*;
 
 unsafe extern "C" {
-    fn Scintilla_RegisterClasses(instance: HINSTANCE) -> i32;
+    fn scintilla_new() -> *mut gtk::ffi::GtkWidget;
+    fn scintilla_send_message(
+        widget: *mut c_void,
+        message: u32,
+        w_param: usize,
+        l_param: isize,
+    ) -> isize;
     fn rstpd_document_release(document: *mut c_void);
-}
-unsafe extern "system" {
-    fn CreateLexer(name: *const i8) -> *mut c_void;
+    fn rstpd_copy_notification(
+        source: *const c_void,
+        destination: *mut NativeNotification,
+        text_limit: usize,
+    );
+    fn CreateLexer(name: *const c_char) -> *mut c_void;
     fn GetLexerCount() -> i32;
-    fn GetLexerName(index: u32, name: *mut i8, len: i32);
+    fn GetLexerName(index: u32, name: *mut c_char, len: i32);
 }
 
-/// # Safety
-/// `instance` must be the current executable's valid module handle.
-pub unsafe fn register(instance: HINSTANCE) -> Result<()> {
-    if unsafe { Scintilla_RegisterClasses(instance) } == 0 {
-        return Err("Could not initialize the built-in editor.".into());
-    }
-    Ok(())
+#[repr(C)]
+#[derive(Default)]
+struct NativeNotification {
+    code: u32,
+    position: isize,
+    ch: i32,
+    modification: i32,
+    updated: i32,
+    x: i32,
+    y: i32,
+    text: *const u8,
+    text_length: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Notification {
+    pub code: u32,
+    pub position: isize,
+    pub ch: i32,
+    pub modification: i32,
+    pub updated: i32,
+    pub x: i32,
+    pub y: i32,
+    /// Owned UTF-8 URI list for `SCN_URIDROPPED`; absent for other notifications.
+    pub text: Option<String>,
 }
 
 pub fn available_lexers() -> Vec<String> {
@@ -198,10 +229,10 @@ impl Palette {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Editor {
-    pub(crate) hwnd: HWND,
-    _ui_thread: PhantomData<Rc<()>>,
+    widget: gtk::Widget,
+    alive: Rc<Cell<bool>>,
 }
 
 pub struct DocumentHandle {
@@ -219,34 +250,21 @@ impl Drop for DocumentHandle {
 }
 
 impl Editor {
-    /// # Safety
-    /// Handles must be valid and belong to the calling UI thread; register first.
-    /// The control and its parent must stay alive for all uses of this view.
-    pub unsafe fn new(parent: HWND, instance: HINSTANCE, id: usize, visible: bool) -> Result<Self> {
-        let class: Vec<u16> = "Scintilla\0".encode_utf16().collect();
-        let hwnd = unsafe {
-            CreateWindowExW(
-                0,
-                class.as_ptr(),
-                std::ptr::null(),
-                WS_CHILD | WS_TABSTOP | if visible { WS_VISIBLE } else { 0 },
-                0,
-                0,
-                1,
-                1,
-                parent,
-                id as _,
-                instance,
-                null_mut(),
-            )
-        };
-        if hwnd.is_null() {
-            return Err(std::io::Error::last_os_error().to_string());
+    /// Create an owning editor on GTK's initialized main thread.
+    pub fn new() -> Result<Self> {
+        if !gtk::is_initialized_main_thread() {
+            return Err("Initialize GTK on the UI thread before creating an editor.".into());
         }
-        let editor = Self {
-            hwnd,
-            _ui_thread: PhantomData,
-        };
+        let raw = unsafe { scintilla_new() };
+        if raw.is_null() {
+            return Err("Could not create the native editor widget.".into());
+        }
+        // GtkWidget's conversion sinks the constructor's floating reference.
+        let widget: gtk::Widget = unsafe { from_glib_none(raw) };
+        let alive = Rc::new(Cell::new(true));
+        let destroyed = Rc::clone(&alive);
+        widget.connect_destroy(move |_| destroyed.set(false));
+        let editor = Self { widget, alive };
         for (message, value) in [
             (SCI_SETCODEPAGE, 65001),
             (SCI_SETTABWIDTH, 4),
@@ -261,8 +279,8 @@ impl Editor {
             (SCI_SETSCROLLWIDTH, 1),
             (SCI_SETCARETLINEVISIBLE, 1),
             (SCI_SETCARETWIDTH, 2),
-            (SCI_SETTECHNOLOGY, 1),
             (SCI_SETLAYOUTCACHE, 2),
+            (SCI_USEPOPUP, 1),
             (SCI_AUTOCSETIGNORECASE, 1),
             (SCI_AUTOCSETORDER, 1),
             (SCI_AUTOCSETMULTI, 1),
@@ -292,7 +310,67 @@ impl Editor {
         }
         Ok(editor)
     }
-    pub fn send(self, message: u32, w: usize, l: isize) -> isize {
+    pub fn widget(&self) -> &gtk::Widget {
+        &self.widget
+    }
+    /// Notifications are copied while Scintilla's stack-owned signal payload is valid.
+    pub fn connect_notify(&self, handler: impl Fn(Notification) + 'static) {
+        self.assert_alive();
+        self.widget
+            .connect_local("sci-notify", false, move |values| {
+                let mut native = NativeNotification::default();
+                unsafe {
+                    let source = glib::gobject_ffi::g_value_get_boxed(values[2].to_glib_none().0);
+                    assert!(
+                        !source.is_null(),
+                        "Scintilla emitted an empty notification."
+                    );
+                    rstpd_copy_notification(source, &mut native, MAX_DOCUMENT_BYTES + 1);
+                }
+                let text = if native.code == SCN_URIDROPPED {
+                    if native.text.is_null() {
+                        glib::g_warning!("rstpd", "Scintilla emitted a URI drop without text.");
+                        return None;
+                    }
+                    if native.text_length > MAX_DOCUMENT_BYTES {
+                        glib::g_warning!(
+                            "rstpd",
+                            "Dropped URI list exceeds the {MAX_DOCUMENT_BYTES}-byte input limit."
+                        );
+                        return None;
+                    }
+                    let bytes =
+                        unsafe { std::slice::from_raw_parts(native.text, native.text_length) };
+                    match std::str::from_utf8(bytes) {
+                        Ok(text) => Some(text.to_owned()),
+                        Err(error) => {
+                            glib::g_warning!(
+                                "rstpd",
+                                "Dropped URI list is not valid UTF-8: {error}"
+                            );
+                            return None;
+                        }
+                    }
+                } else {
+                    None
+                };
+                handler(Notification {
+                    code: native.code,
+                    position: native.position,
+                    ch: native.ch,
+                    modification: native.modification,
+                    updated: native.updated,
+                    x: native.x,
+                    y: native.y,
+                    text,
+                });
+                None
+            });
+    }
+    fn assert_alive(&self) {
+        assert!(self.alive.get(), "Editor widget has been destroyed.");
+    }
+    pub fn send(&self, message: u32, w: usize, l: isize) -> isize {
         assert!(
             SCALAR_MESSAGES.binary_search(&message).is_ok(),
             "Pointer-bearing Scintilla message {message} requires a typed wrapper."
@@ -302,21 +380,18 @@ impl Editor {
     /// # Safety
     /// Pointer arguments must satisfy the selected Scintilla message's lifetime, size,
     /// ownership and mutability requirements. Only call on the control's UI thread.
-    pub unsafe fn send_raw(self, message: u32, w: usize, l: isize) -> isize {
-        assert!(
-            unsafe { IsWindow(self.hwnd) } != 0,
-            "Editor window is no longer alive."
-        );
-        unsafe { SendMessageW(self.hwnd, message, w, l) }
+    pub unsafe fn send_raw(&self, message: u32, w: usize, l: isize) -> isize {
+        self.assert_alive();
+        unsafe { scintilla_send_message(self.widget.as_ptr().cast(), message, w, l) }
     }
-    pub fn create_document(self) -> Result<DocumentHandle> {
+    pub fn create_document(&self) -> Result<DocumentHandle> {
         let raw = unsafe { self.send_raw(SCI_CREATEDOCUMENT, 0, 0) } as *mut c_void;
         Ok(DocumentHandle {
             raw: NonNull::new(raw).ok_or("Could not allocate document.")?,
             _ui_thread: PhantomData,
         })
     }
-    pub fn attach(self, document: &DocumentHandle) {
+    pub fn attach(&self, document: &DocumentHandle) {
         if unsafe { self.send_raw(SCI_GETDOCPOINTER, 0, 0) } != document.raw.as_ptr() as isize {
             unsafe {
                 self.send_raw(SCI_SETDOCPOINTER, 0, document.raw.as_ptr() as isize);
@@ -324,13 +399,13 @@ impl Editor {
         }
         self.send(SCI_SETCODEPAGE, 65001, 0);
     }
-    pub fn length(self) -> usize {
+    pub fn length(&self) -> usize {
         self.send(SCI_GETLENGTH, 0, 0) as usize
     }
-    pub fn position(self) -> usize {
+    pub fn position(&self) -> usize {
         self.send(SCI_GETCURRENTPOS, 0, 0) as usize
     }
-    pub fn text(self) -> Result<String> {
+    pub fn text(&self) -> Result<String> {
         let len = self.length();
         let mut bytes = vec![0u8; len + 1];
         unsafe {
@@ -340,7 +415,7 @@ impl Editor {
         String::from_utf8(bytes)
             .map_err(|e| format!("The editor buffer contains invalid UTF-8: {e}"))
     }
-    fn validate_range(self, range: &Range<usize>) -> Result<()> {
+    fn validate_range(&self, range: &Range<usize>) -> Result<()> {
         if range.start > range.end || range.end > self.length() {
             return Err("Text range is outside the document.".into());
         }
@@ -352,7 +427,7 @@ impl Editor {
         }
         Ok(())
     }
-    pub fn range(self, range: Range<usize>) -> Result<String> {
+    pub fn range(&self, range: Range<usize>) -> Result<String> {
         self.validate_range(&range)?;
         #[repr(C)]
         struct TextRange {
@@ -377,7 +452,7 @@ impl Editor {
         String::from_utf8(bytes)
             .map_err(|e| format!("The editor range contains invalid UTF-8: {e}"))
     }
-    pub fn set_text(self, text: &str) -> Result<()> {
+    pub fn set_text(&self, text: &str) -> Result<()> {
         if text.len() > MAX_DOCUMENT_BYTES {
             return Err("Text exceeds the document size limit.".into());
         }
@@ -391,13 +466,13 @@ impl Editor {
         self.send(SCI_GOTOPOS, 0, 0);
         self.check_status()
     }
-    fn check_status(self) -> Result<()> {
+    fn check_status(&self) -> Result<()> {
         match self.send(SCI_GETSTATUS, 0, 0) {
             0 => Ok(()),
             status => Err(format!("Native editor operation failed (status {status}).")),
         }
     }
-    pub fn replace(self, range: Range<usize>, text: &str) -> Result<()> {
+    pub fn replace(&self, range: Range<usize>, text: &str) -> Result<()> {
         self.validate_range(&range)?;
         if self.length().saturating_sub(range.len()) + text.len() > MAX_DOCUMENT_BYTES {
             return Err("This edit would exceed the 128 MiB document limit.".into());
@@ -410,21 +485,21 @@ impl Editor {
         }
         self.check_status()
     }
-    pub fn replace_all(self, text: &str) -> Result<()> {
+    pub fn replace_all(&self, text: &str) -> Result<()> {
         self.send(SCI_BEGINUNDOACTION, 0, 0);
         let result = self.replace(0..self.length(), text);
         self.send(SCI_ENDUNDOACTION, 0, 0);
         result
     }
-    pub fn select(self, range: Range<usize>) {
+    pub fn select(&self, range: Range<usize>) {
         self.send(SCI_SETSEL, range.start, range.end as isize);
         self.send(SCI_SCROLLCARET, 0, 0);
     }
-    pub fn selection(self) -> Range<usize> {
+    pub fn selection(&self) -> Range<usize> {
         self.send(SCI_GETSELECTIONSTART, 0, 0) as usize
             ..self.send(SCI_GETSELECTIONEND, 0, 0) as usize
     }
-    pub fn transform_selections(self, transform: impl Fn(&str) -> String) -> Result<()> {
+    pub fn transform_selections(&self, transform: impl Fn(&str) -> String) -> Result<()> {
         let mut edits = Vec::new();
         for i in 0..self.send(SCI_GETSELECTIONS, 0, 0) as usize {
             let range = self.send(SCI_GETSELECTIONNSTART, i, 0) as usize
@@ -451,13 +526,21 @@ impl Editor {
         self.send(SCI_ENDUNDOACTION, 0, 0);
         result
     }
-    pub fn language(self, language: &Language, palette: Palette) -> Result<()> {
+    pub fn language(&self, language: &Language, palette: Palette) -> Result<()> {
+        self.language_with_font(language, palette, &EditorFont::default())
+    }
+    pub fn language_with_font(
+        &self,
+        language: &Language,
+        palette: Palette,
+        editor_font: &EditorFont,
+    ) -> Result<()> {
         self.clear_indicator(crate::markdown::STRIKE_INDICATOR);
         if language.uses_container() {
             unsafe {
                 self.send_raw(SCI_SETILEXER, 0, 0);
             }
-            self.theme(language, palette);
+            self.theme_with_font(language, palette, editor_font);
             return Ok(());
         }
         let name = CString::new(language.lexer.as_str()).map_err(|e| e.to_string())?;
@@ -527,10 +610,10 @@ impl Editor {
                 "0"
             },
         );
-        self.theme(language, palette);
+        self.theme_with_font(language, palette, editor_font);
         Ok(())
     }
-    fn property(self, name: &str, value: &str) {
+    fn property(&self, name: &str, value: &str) {
         let name = CString::new(name).expect("static property");
         let value = CString::new(value).expect("static property");
         unsafe {
@@ -541,7 +624,10 @@ impl Editor {
             );
         }
     }
-    pub fn theme(self, language: &Language, palette: Palette) {
+    pub fn theme(&self, language: &Language, palette: Palette) {
+        self.theme_with_font(language, palette, &EditorFont::default());
+    }
+    pub fn theme_with_font(&self, language: &Language, palette: Palette, editor_font: &EditorFont) {
         self.send(SCI_STYLESETFORE, 32, palette.text as isize);
         self.send(SCI_STYLESETBACK, 32, palette.background as isize);
         self.send(SCI_STYLESETBOLD, 32, 0);
@@ -552,7 +638,7 @@ impl Editor {
             .custom
             .as_ref()
             .and_then(|custom| custom.styles[0].font.as_deref())
-            .unwrap_or("Consolas");
+            .unwrap_or(editor_font.family());
         let font = CString::new(default_font).expect("validated font family");
         unsafe {
             self.send_raw(SCI_STYLESETFONT, 32, font.as_ptr() as isize);
@@ -561,8 +647,9 @@ impl Editor {
             .custom
             .as_ref()
             .and_then(|custom| custom.styles[0].font_size)
-            .unwrap_or(11);
-        self.send(SCI_STYLESETSIZEFRACTIONAL, 32, size as isize * 100);
+            .map(|size| u32::from(size) * 100)
+            .unwrap_or(editor_font.size_hundredths());
+        self.send(SCI_STYLESETSIZEFRACTIONAL, 32, size as isize);
         self.send(SCI_STYLECLEARALL, 0, 0);
         let count = self.send(SCI_GETNAMEDSTYLES, 0, 0).clamp(0, 256) as usize;
         let base_styles = if language.lexer == "markdown" {
@@ -710,8 +797,24 @@ impl Editor {
             }
         }
         self.send(SCI_COLOURISE, 0, -1);
+        self.update_line_number_margin();
     }
-    fn context(self) -> Result<(usize, usize, String)> {
+    pub fn update_line_number_margin(&self) {
+        let digits = self
+            .send(SCI_GETLINECOUNT, 0, 0)
+            .max(1)
+            .to_string()
+            .len()
+            .max(4);
+        let sample = CString::new("9".repeat(digits)).expect("decimal digits");
+        let width = unsafe { self.send_raw(SCI_TEXTWIDTH, 33, sample.as_ptr() as isize) }
+            .saturating_add(12)
+            .max(52);
+        if self.send(SCI_GETMARGINWIDTHN, 0, 0) != width {
+            self.send(SCI_SETMARGINWIDTHN, 0, width);
+        }
+    }
+    fn context(&self) -> Result<(usize, usize, String)> {
         let pos = self.position();
         let mut begin = pos.saturating_sub(32_768);
         while self.send(SCI_GETCHARAT, begin, 0) as u8 & 0xc0 == 0x80 {
@@ -724,7 +827,7 @@ impl Editor {
         Ok((begin, pos, self.range(begin..end)?))
     }
     pub fn complete(
-        self,
+        &self,
         language: &Language,
         extra: &[crate::completion::Api],
         manual: bool,
@@ -748,7 +851,7 @@ impl Editor {
         }
         Ok(())
     }
-    pub fn call_tip(self, language: &Language, extra: &[crate::completion::Api]) -> Result<()> {
+    pub fn call_tip(&self, language: &Language, extra: &[crate::completion::Api]) -> Result<()> {
         let (begin, pos, text) = self.context()?;
         if let Some(tip) = crate::completion::call_tip(&text, pos - begin, &language.name, extra) {
             let signature = CString::new(tip.signature)
@@ -770,7 +873,7 @@ impl Editor {
         }
         Ok(())
     }
-    pub fn highlight(self, result: &crate::udl::Highlight) -> Result<()> {
+    pub fn highlight(&self, result: &crate::udl::Highlight) -> Result<()> {
         if result.styles.len() != self.length() {
             return Err("Highlight result no longer matches the document.".into());
         }
@@ -791,31 +894,30 @@ impl Editor {
         }
         Ok(())
     }
-    pub fn clear_styles(self) {
+    pub fn clear_styles(&self) {
         self.send(SCI_STARTSTYLING, 0, 0);
         self.send(SCI_SETSTYLING, self.length(), 0);
         self.clear_indicator(crate::markdown::STRIKE_INDICATOR);
     }
-    pub fn indicator(self, id: usize, range: Range<usize>) -> Result<()> {
+    pub fn indicator(&self, id: usize, range: Range<usize>) -> Result<()> {
         self.validate_range(&range)?;
         self.send(SCI_SETINDICATORCURRENT, id, 0);
         self.send(SCI_INDICATORFILLRANGE, range.start, range.len() as isize);
         Ok(())
     }
-    pub fn clear_indicator(self, id: usize) {
+    pub fn clear_indicator(&self, id: usize) {
         self.send(SCI_SETINDICATORCURRENT, id, 0);
         self.send(SCI_INDICATORCLEARRANGE, 0, self.length() as isize);
     }
-    pub fn clear_diff(self) {
+    pub fn clear_diff(&self) {
         for id in [20, 21] {
             self.send(SCI_MARKERDELETEALL, id, 0);
             self.clear_indicator(id);
         }
     }
-    pub fn focus(self) {
-        unsafe {
-            SetFocus(self.hwnd);
-        }
+    pub fn focus(&self) {
+        self.assert_alive();
+        self.widget.grab_focus();
     }
 }
 

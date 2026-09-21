@@ -1,45 +1,56 @@
-# rstpd
+# rstpd for Linux
 
-A lightweight, native Windows text editor: a new Rust application, not a
-Notepad++ port. No plugins, extension discovery, embedded browser, command
+A lightweight, native Linux text editor using **GTK3, stock Adwaita, Scintilla
+and Lexilla**. This is a Linux-specific derivative of
+[Sockolet/rstpd](https://github.com/Sockolet/rstpd), retaining its Git history
+and MIT license. The Windows application remains in its original repository.
+The starting point is upstream commit `54fa244e963efdc48b1c167f04b7b23225490f5f`.
+
+GTK3 is intentional: the pinned Scintilla supports GTK2/3, not GTK4.
+Keeping that editing engine preserves multiple carets, rectangular selections,
+Lexilla language coverage and UDL highlighting. This is not a GtkSourceView
+rewrite or a GTK4/libadwaita application. GTK supplies the Adwaita controls,
+symbolic toolbar icons and dialogs; there is no application CSS theme.
+Light, dark and system-preference modes are available. System mode follows
+GNOME's color-scheme setting when available, otherwise the initial GTK preference.
+
+No plugins, extension discovery, embedded browser, command
 runner, script host, or automatic updater.
 
 The application, document/session management, compare workflow, JSON tools,
 search, encoding conversion, and UI integration are written in Rust.
 **Scintilla and Lexilla are statically linked C++ editor components**, with a
-small C++ adapter for reference-counted document release.
+small C++ adapter for reference-counted document release and GTK notifications.
 This is not a pure-Rust implementation of the editing engine. No Notepad++
 application code or plugin code is included.
 
 ## Run
 
-Download the portable Windows ZIP from the
-[GitHub releases](https://github.com/Sockolet/rstpd/releases).
-For a source checkout, use the build instructions below to create `dist`.
+Build from source using the instructions below. There is no published Linux
+binary release yet; the upstream Windows ZIP is not a Linux package.
 
-Open `dist\rstpd-0.2.4\rstpd.exe`, or extract the portable ZIP and open
-`rstpd-0.2.4\rstpd.exe`. No installation or administrator access is needed.
-Windows 10/11, x64. Keep the redistribution notices with the executable.
-
-```powershell
-.\dist\rstpd-0.2.4\rstpd.exe
-.\dist\rstpd-0.2.4\rstpd.exe .\example.rs .\example.json
+```sh
+./target/release/rstpd
+./target/release/rstpd ./example.rs ./example.json
+./target/release/rstpd --session-dir "$HOME/.local/state/rstpd-work" ./notes.md
 ```
 
-Use `--session-dir "C:\path\to\session"` for a separate workspace. Only one
+Use `--session-dir DIRECTORY` for a separate workspace. Only one
 instance may use a session directory at a time. Opening another instance
-does not forward filenames to the existing instance.
+does not forward filenames to the existing instance. Local files can also be
+dropped onto the editor. Remote URLs are not opened or downloaded.
+Use `--` before filenames beginning with `-`.
 
-Close an older rstpd instance before opening this release with the same session.
-Version 0.2 reads version-1 sessions and saves version-2 sessions, including
-language/completion definitions. Version 0.1 deliberately refuses version-2
-sessions rather than silently dropping the new settings.
+Recovery reads upstream version-1 and version-2 schemas and saves version 2,
+including language/completion definitions. Do not share a live session directory
+between platforms: filenames and locking semantics differ.
 
 ## Features
 
 | Area | Implementation |
 |---|---|
-| Native UI | Windows title bar, menus, dialogs and controls; DPI-aware Segoe UI chrome, light/dark/system themes, closeable tabs and a compact Lucide icon toolbar |
+| Native UI | GTK3 Adwaita menus, dialogs and controls; desktop scaling, light/dark/system preference, closeable tabs and a symbolic icon toolbar |
+| Editor font | Native font-family and point-size chooser; per-workspace persistence across tabs and split panes |
 | Highlighting | All 94 source-language inventory entries mapped, plus the full pinned Lexilla catalog; filename detection, mode selection, and data-only UDL 2.0/2.1 import |
 | Markdown | CommonMark/GFM parsing with visible headings, emphasis, links, lists, quotes, tasks, tables, inline/fenced/indented code and strikethrough |
 | Completion | Keywords, local declarations, member/context suggestions, common built-in APIs, parameter hints and importable completion signatures |
@@ -51,21 +62,33 @@ sessions rather than silently dropping the new settings.
 | JSON | Lossless JSON/JSON5 pretty-print/minify, automatically refreshed tree, RFC 6901 pointers and source-span navigation |
 | Text operations | Upper/lower/title/sentence/inverted case; case-sensitive, case-insensitive, natural and exact decimal sorting; reverse/join, deduplication and whitespace operations |
 | Encoding | UTF-8, UTF-16/32 LE/BE, Windows/ISO/OEM code pages, Shift-JIS, EUC-JP, ISO-2022-JP, GBK/GB18030, Big5, EUC-KR, KOI8 and Mac encodings |
-| Line endings | CRLF, LF and CR conversion |
+| Line endings | CRLF, LF and CR conversion; new Linux documents default to LF |
 | Recovery | Background atomic snapshots of all tabs, including unnamed documents; restore after restart or crash |
 
 To choose documents for a split, click a pane and then choose its tab.
 The icon toolbar keeps the same New, Open, Save, Find, Split, Compare, JSON tree
 and Document map actions. Hover for a descriptive tooltip and shortcut.
 Button names remain available to accessibility tools, and keyboard shortcuts
-and menus are unchanged. Icons are drawn natively at the current DPI and
-recolored for light/dark themes; no icon font or browser runtime is required.
+and editing commands are retained. Icons come from the standard GTK icon theme
+and adapt to light/dark appearance; no icon font or browser runtime is required.
 The right-hand document's tab is marked `[R]`. Drag the divider to resize.
 **Compare** compares the active tab with the next tab (wrapping at the end).
 Editing either document automatically schedules a comparison refresh.
 Old worker results are discarded if the documents changed in the meantime;
 refresh does not move your editing caret. EOL representation is ignored during
 line comparison.
+
+**View > Editor font...** selects the default editor font family and size
+(4–72 points) using GTK's installed-font chooser. The choice is saved with the
+workspace and applies to current and new tabs, both split panes, line numbers
+and completion/call-tip text. It does not change the Adwaita interface font.
+Confirming resets both panes' temporary zoom; **Reset zoom** subsequently
+returns to the selected size. Cancel leaves the settings unchanged.
+
+Syntax bold, italic and underline styling is retained. Explicit font-family
+and size overrides in imported language definitions still take precedence.
+The document map keeps its compact 2-point text. Old sessions without a font
+preference continue to use Monospace at 11 points.
 
 Line operations affect complete selected lines, or the whole document when
 there is no selection. Case conversion operates on selected text, including
@@ -96,10 +119,10 @@ into the same generic identifier color, including styles used by embedded markup
 
 The Language menu starts with **Plain text**, followed by fixed **A-C, D-F,
 G-I, J-L, M-O, P-R, S-U and V-Z** groups. Languages are alphabetized within
-each group, with additional columns for longer lists. Imported definitions
+each group, with GTK's native scrolling for long menus. Imported definitions
 have their own **User-defined** group; import/removal commands are at the bottom.
 
-`assets\language-coverage.tsv` records the 94 source-language entries and their
+`assets/language-coverage.tsv` records the 94 source-language entries and their
 extensions from the upstream inventory with model date July 14, 2026, checked
 September 19, 2026. The internal `searchResult` pane format is not a source-file
 language. Shared/ambiguous extensions can still be selected explicitly in
@@ -121,9 +144,9 @@ can be imported with **Language > Import completion API for current language**
 using `AutoComplete / KeyWord / Overload / Param` XML data.
 Both kinds of definitions persist in the session.
 
-```powershell
-.\dist\rstpd-0.2.4\rstpd.exe --import-language .\language.xml .\example.rstlang
-.\dist\rstpd-0.2.4\rstpd.exe --completion-api .\functions.xml .\example.rs
+```sh
+./target/release/rstpd --import-language ./language.xml ./example.rstlang
+./target/release/rstpd --completion-api ./functions.xml ./example.rs
 ```
 
 The completion API import is associated with the active file's language.
@@ -158,13 +181,14 @@ the document. Regex errors are reported, not treated as "no match".
 
 ## Recovery and data safety
 
-Recovery is stored as **plaintext** in
-`%LOCALAPPDATA%\rstpd\session.json`, under the user's normal directory
-permissions. This may include sensitive unsaved text. Nothing is uploaded.
-Existing installations with recovery state in `%LOCALAPPDATA%\RSTPad` keep
-using that legacy folder, including its lock file, unless recovery state
-already exists in the new `rstpd` folder. Nothing is moved or deleted during
-the rename. `--session-dir` still explicitly selects a separate session.
+Recovery is stored as **plaintext** in `$XDG_STATE_HOME/rstpd-gtk/session.json`,
+or `~/.local/state/rstpd-gtk/session.json` when `XDG_STATE_HOME` is unset.
+New recovery directories are private to the user (0700), and new files use
+0600 permissions. This may include sensitive unsaved text. Nothing is uploaded.
+The Linux port does not inspect or migrate Windows recovery directories.
+`--session-dir` explicitly selects a separate session, protected by an
+advisory lock held for the process lifetime. The lock file is deliberately
+retained after exit; an existing lock file alone does not indicate a running app.
 Snapshots run approximately every three seconds after changes; a crash can
 lose edits since the last completed snapshot. Normal exit waits for the final
 snapshot and refuses to exit if that save fails.
@@ -172,9 +196,23 @@ snapshot and refuses to exit if that save fails.
 Closing the app preserves every tab without asking for filenames.
 Closing an individual dirty tab offers Save / Discard / Cancel; **Discard
 removes that tab's recovery copy**. Autosave never writes the original files.
-Explicit Save uses a flushed temporary file and Windows atomic replacement.
+Explicit Save uses a flushed temporary file, same-directory atomic rename
+and parent-directory synchronization. Existing file permission bits are retained.
 An external-change check warns before overwriting a file that changed on disk.
 It is a check, not an exclusive lock against other editors.
+
+Linux saving requires working directory `fsync`, enforceable private permissions,
+and `renameat2(RENAME_NOREPLACE)` support for new files. Unsupported operations
+fail explicitly rather than using a non-atomic fallback. Some FAT/exFAT mount
+configurations cannot satisfy the private-permission checks. Recovery directories
+must be user-owned and not writable by other users; XDG/HOME roots must be absolute.
+
+Existing hard-linked, special-mode, owner-read-only or foreign-owned files are
+refused rather than silently changing their link/ownership semantics. Explicit
+saves follow valid file symlinks without replacing the links; dangling links and
+recovery-file symlinks are rejected. Ordinary permissions and owner/group are
+preserved, **but ACLs and extended attributes are not preserved by atomic
+replacement**. Avoid saving metadata-sensitive files with this initial port.
 
 Invalid recovery files are left untouched and reported at startup. To recover
 manually, keep a copy of the file, then move it out of the session directory.
@@ -210,54 +248,78 @@ Conversions that cannot represent every character are rejected.
 
 ## Build from source
 
-Install Rust 1.98 or newer (MSVC x64 toolchain) and Visual Studio's **Desktop development
-with C++** workload, including the Windows SDK. PowerShell 7 is recommended.
+Install Rust 1.95 or newer, a C++17 compiler, `pkg-config`, `unzip`, and GTK 3.24+
+development libraries. GTK remains a system-provided runtime dependency;
+Scintilla and Lexilla are statically linked.
 
-```powershell
-.\scripts\build.ps1
+Debian/Ubuntu:
+
+```sh
+sudo apt install build-essential pkg-config libgtk-3-dev unzip
 ```
 
-The script verifies pinned source archive hashes, extracts editor sources and
-language data, runs tests, builds the release binary, copies licenses, and
-creates `dist\rstpd-0.2.4-windows-x64.zip` with a SHA-256 sidecar. Release
-directories are versioned so building does not overwrite a running older EXE.
-Rust dependencies are locked in `Cargo.lock`; the first build needs access to
-the Rust package registry. The native source archives are already included.
+Arch Linux:
 
-For development, once Rust is on PATH:
+```sh
+sudo pacman -S --needed base-devel gtk3 unzip rust
+```
 
-```powershell
-.\scripts\bootstrap.ps1
+Build and run:
+
+```sh
+./scripts/bootstrap.sh
+cargo build --locked --release
+./target/release/rstpd
+```
+
+The bootstrap script verifies pinned SHA-256 hashes before extracting the
+vendored Scintilla/Lexilla sources and SciTE language data. Rust dependencies
+are locked in `Cargo.lock`; the first build needs access to the Rust package
+registry. No sources are downloaded by the native build.
+
+For development and validation:
+
+```sh
 cargo run --locked
 cargo test --locked --tests
 cargo clippy --locked --all-targets -- -D warnings
-.\scripts\smoke.ps1
+cargo fmt --check
 ```
 
-The smoke script uses isolated profiles and sessions. It checks no-argument
-first launch, startup with empty/recovered sessions, native controls, and
-live comparison/JSON, advanced search, encoding, parameter hints, and imported
-definition persistence. It terminates only the process it
-started to simulate a crash, verifies recovery, and removes its temporary
-session files without accessing your real recovery data. Own-window screenshots
-are written to `target`.
-Markdown checks verify rendered colors/font attributes in light/dark themes,
-live editing, split/map views and recovery, rather than only checking lexer IDs.
+GUI tests need a display. On a headless machine, install `xvfb` (Debian/Ubuntu)
+or `xorg-server-xvfb` (Arch) and run:
+
+```sh
+xvfb-run -a cargo test --locked --tests
+```
+
+`./scripts/build.sh` combines bootstrap, tests and release build. The GTK
+workflow test uses isolated temporary recovery data, covering command wiring,
+split/map views, search and replacement, comparison refresh, JSON navigation,
+encoding/EOL, imported definitions, completion and recovery. Native editor
+tests also exercise all lexers, Unicode/NUL handling, multiple selections,
+rectangular editing, undo, and visible Markdown styles in both palettes.
+
+For a per-user launcher, put `target/release/rstpd` on your `PATH` and install
+`assets/io.github.Sockolet.rstpd-gtk.desktop` under
+`~/.local/share/applications/`. No installer, Flatpak or distribution package
+is included. Keep the license and third-party notices with redistributed builds.
 
 ## Source layout and trust boundary
 
-- `src\ui.rs`: native Windows UI, event queue and command wiring.
-- `src\toolbar.rs`: theme-aware Lucide vector icons and native tooltip ownership.
-- `src\editor.rs`: editor/lexer FFI boundary and view configuration.
-- `src\native_bridge.cxx`: minimal adapter releasing owned native document references.
-- `src\completion.rs`: contextual suggestions, declarations, signatures and API data import.
-- `src\udl.rs`: non-executable language definitions and Rust container highlighting.
-- `src\markdown.rs`: Markdown source spans, semantic styles and folding.
-- `src\syntax.rs`: shared semantic token roles and font-attribute selection.
-- `src\json_tools.rs`: bounded JSON/JSON5 validation and lossless formatting.
-- `src\core.rs`: encoding, bounded search, text transforms, diff and JSON spans.
-- `src\session.rs`: atomic persistence, session validation and recovery worker.
-- `src\languages.rs`: app-owned language aliases and keyword selection.
+- `src/ui.rs`: GTK3 controls, event queue, background work and command wiring.
+- `src/ui/tests.rs`: GTK workflow and recovery regression tests.
+- `src/toolbar.rs`: standard GTK symbolic toolbar buttons and tooltips.
+- `src/editor.rs`: owning GTK editor adapter, typed Scintilla messages and view configuration.
+- `src/native_bridge.cxx`: native document release and notification adapter.
+- `src/completion.rs`: contextual suggestions, declarations, signatures and API data import.
+- `src/udl.rs`: non-executable language definitions and Rust container highlighting.
+- `src/markdown.rs`: Markdown source spans, semantic styles and folding.
+- `src/syntax.rs`: shared semantic token roles and font-attribute selection.
+- `src/json_tools.rs`: bounded JSON/JSON5 validation and lossless formatting.
+- `src/core.rs`: portable encoding, bounded search, text transforms, diff and JSON spans.
+- `src/session.rs`: atomic persistence, Linux advisory locking and recovery worker.
+- `src/languages.rs`: app-owned language aliases and keyword selection.
 - `build.rs`: static native builds and build-time extraction of lexer constants,
   keyword data and semantic style roles.
 
