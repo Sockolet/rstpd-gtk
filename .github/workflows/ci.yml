@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: Build and test on Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # xvfb is required because the GUI tests create real GTK windows.
+      - name: Install GTK3 and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libgtk-3-dev unzip xvfb
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Unpack pinned editor sources
+        run: ./scripts/bootstrap.sh
+
+      - name: Formatting
+        run: cargo fmt --check
+
+      - name: Lints
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Tests
+        run: xvfb-run -a cargo test --locked --tests
+
+      # Parsers are platform-independent and need no display; release mode keeps
+      # the deterministic fuzz corpus to a few seconds.
+      - name: Parser fuzz guard
+        run: cargo test --locked --release --test fuzz_parsers
+
+      - name: Release build
+        run: cargo build --locked --release

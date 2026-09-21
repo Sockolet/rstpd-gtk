@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build, verify and publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GTK3 and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libgtk-3-dev unzip xvfb
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+
+      - name: Unpack pinned editor sources
+        run: ./scripts/bootstrap.sh
+
+      # A tag must never publish something that would fail CI.
+      - name: Formatting
+        run: cargo fmt --check
+
+      - name: Lints
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Tests
+        run: xvfb-run -a cargo test --locked --tests
+
+      - name: Parser fuzz guard
+        run: cargo test --locked --release --test fuzz_parsers
+
+      - name: Release build
+        run: cargo build --locked --release
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          name="rstpd-${version}-linux-x86_64"
+          mkdir -p "dist/${name}/share/applications" "dist/${name}/licenses"
+          cp target/release/rstpd "dist/${name}/"
+          cp README.md LICENSE THIRD_PARTY_NOTICES.txt "dist/${name}/"
+          cp assets/io.github.Sockolet.rstpd-gtk.desktop "dist/${name}/share/applications/"
+          cp vendor/scintilla/License.txt "dist/${name}/licenses/Scintilla-Lexilla-SciTE.txt"
+          tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${name}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              "${{ steps.package.outputs.archive }}" \
+              "${{ steps.package.outputs.checksum }}" --clobber
+          else
+            gh release create "$TAG" \
+              "${{ steps.package.outputs.archive }}" \
+              "${{ steps.package.outputs.checksum }}" \
+              --title "rstpd-gtk ${{ steps.package.outputs.version }}" \
+              --generate-notes
+          fi
