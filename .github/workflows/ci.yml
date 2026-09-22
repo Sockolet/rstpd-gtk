@@ -40,6 +40,7 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Tests
+        timeout-minutes: 10
         run: xvfb-run -a cargo test --locked --tests
 
       # Parsers are platform-independent and need no display; release mode keeps

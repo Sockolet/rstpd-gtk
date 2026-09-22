@@ -90,9 +90,11 @@ fn respond_to_font_dialog(
     let initial = app.editor_font.clone();
     let observed = Rc::new(RefCell::new(None));
     let capture = observed.clone();
+    let existing = gtk::Window::list_toplevels();
     let timer = glib::timeout_add_local(Duration::from_millis(20), move || {
         let dialog = gtk::Window::list_toplevels()
             .into_iter()
+            .filter(|window| !existing.contains(window))
             .find_map(|window| window.downcast::<gtk::FontChooserDialog>().ok());
         let Some(dialog) = dialog else {
             return glib::ControlFlow::Continue;
@@ -473,9 +475,11 @@ fn with_message_response(
 ) {
     let observed = Rc::new(Cell::new(false));
     let capture = observed.clone();
+    let existing = gtk::Window::list_toplevels();
     let timer = glib::timeout_add_local(Duration::from_millis(10), move || {
         let dialog = gtk::Window::list_toplevels()
             .into_iter()
+            .filter(|window| !existing.contains(window))
             .find_map(|window| window.downcast::<gtk::MessageDialog>().ok());
         if let Some(dialog) = dialog {
             capture.set(true);
@@ -862,9 +866,11 @@ fn wait_for_comparison(app: &mut App) {
 fn respond_to_compare_options(app: &mut App, options: CompareOptions, response: gtk::ResponseType) {
     let observed = Rc::new(Cell::new(false));
     let capture = observed.clone();
+    let existing = gtk::Window::list_toplevels();
     let timer = glib::timeout_add_local(Duration::from_millis(10), move || {
         let dialog = gtk::Window::list_toplevels()
             .into_iter()
+            .filter(|window| !existing.contains(window))
             .filter_map(|widget| widget.downcast::<gtk::Window>().ok())
             .filter(|window| window.title().as_deref() == Some("Compare options"))
             .find_map(|window| window.downcast::<gtk::Dialog>().ok());

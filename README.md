@@ -26,8 +26,12 @@ application code or plugin code is included.
 
 ## Run
 
-Build from source using the instructions below. There is no published Linux
-binary release yet; the upstream Windows ZIP is not a Linux package.
+Download the Linux x86_64 archive and its SHA-256 checksum from
+[Releases](https://github.com/Sockolet/rstpd-gtk/releases/latest), or build from
+source using the instructions below. Verify the archive with
+`sha256sum -c rstpd-1.2.0-linux-x86_64.tar.gz.sha256`, extract it, and run
+`./rstpd` from the extracted directory. GTK3 must be installed on the system;
+the upstream Windows ZIP is not a Linux package.
 
 ```sh
 ./target/release/rstpd
