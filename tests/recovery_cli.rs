@@ -110,6 +110,7 @@ fn cli_crash_recovery_keeps_unsaved_text_and_does_not_replace_it_with_disk_chang
                 dirty: true,
                 disk_hash: None,
                 caret: 2,
+                pinned: false,
             }],
             theme: "system".into(),
             ..Session::default()

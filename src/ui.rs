@@ -1,12 +1,17 @@
 use crate::{
+    comparison::{self, CompareOptions, Comparison},
     completion::{self, Api},
     core::{
         self, CaseOp, Difference, EditorFont, Encoding, Eol, JsonNode, LineOp, Result, Search,
         SearchMode,
     },
     editor::{self, DocumentHandle, Editor, Palette, sci::*},
+    folder_search::{self, FolderOptions},
     languages::{self, Language},
+    monitor::{self, Monitor},
+    search_results::{self, Input as SearchInput, Link as ResultLink, Results as SearchResults},
     session::{self, DocumentSnapshot, RecoveryWorker, Session},
+    symbols::ShowSymbols,
     toolbar,
     udl::{self, Highlight},
 };
@@ -17,7 +22,11 @@ use std::{
     fs,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -54,6 +63,7 @@ const MAP: usize = 1051;
 const WRAP: usize = 1052;
 const ZOOM_RESET: usize = 1053;
 const EDITOR_FONT: usize = 1054;
+const MONITOR_FILES: usize = 1055;
 const THEME_SYSTEM: usize = 1060;
 const THEME_LIGHT: usize = 1061;
 const THEME_DARK: usize = 1062;
@@ -61,6 +71,10 @@ const COMPARE: usize = 1070;
 const DIFF_NEXT: usize = 1071;
 const DIFF_PREVIOUS: usize = 1072;
 const COMPARE_CLEAR: usize = 1073;
+const COMPARE_SETTINGS: usize = 1074;
+const COMPARE_SELECTION: usize = 1075;
+const COMPARE_CLIPBOARD: usize = 1076;
+const COMPARE_SAVED: usize = 1077;
 const JSON_FORMAT: usize = 1080;
 const JSON_COMPACT: usize = 1081;
 const JSON_TREE: usize = 1082;
@@ -71,6 +85,28 @@ const EOL_CR: usize = 1092;
 const ABOUT: usize = 1150;
 const SEARCH_CLOSE: usize = 1160;
 const COMPLETE: usize = 1161;
+const FIND_ALL_CURRENT: usize = 1170;
+const FIND_ALL_OPEN: usize = 1171;
+const RESULTS_TOGGLE: usize = 1172;
+const RESULTS_NEXT: usize = 1173;
+const RESULTS_PREVIOUS: usize = 1174;
+const RESULTS_CLEAR: usize = 1175;
+const RESULTS_CLOSE: usize = 1176;
+const RESULTS_CANCEL: usize = 1177;
+const RESULTS_ACTIVATE: usize = 1178;
+const FIND_FILES: usize = 1179;
+const FIND_FILES_RUN: usize = 1180;
+const FIND_FOLDER: usize = 1181;
+const TAB_PIN: usize = 1182;
+const TAB_LEFT: usize = 1183;
+const TAB_RIGHT: usize = 1184;
+const SYMBOL_SPACE: usize = 1300;
+const SYMBOL_EOL: usize = 1301;
+const SYMBOL_NONPRINTING: usize = 1302;
+const SYMBOL_CONTROLS: usize = 1303;
+const SYMBOL_ALL: usize = 1304;
+const SYMBOL_INDENT: usize = 1305;
+const SYMBOL_WRAP: usize = 1306;
 const TITLE_CASE: usize = 1200;
 const SENTENCE_CASE: usize = 1201;
 const INVERT_CASE: usize = 1202;
@@ -149,6 +185,7 @@ thread_local! {
     static EVENTS: RefCell<VecDeque<Event>> = const { RefCell::new(VecDeque::new()) };
     static TABS_UPDATING: Cell<bool> = const { Cell::new(false) };
     static TREE_UPDATING: Cell<bool> = const { Cell::new(false) };
+    static SYMBOLS_UPDATING: Cell<bool> = const { Cell::new(false) };
 }
 
 enum Event {
@@ -157,6 +194,9 @@ enum Event {
     Theme,
     Tab(u64),
     CloseTab(u64),
+    MoveTab(u64, usize),
+    PinTab(u64),
+    StepTab(u64, bool),
     NextTab(bool),
     OtherPane,
     Escape,
@@ -169,6 +209,8 @@ enum Event {
     Uris(String),
     Map(i32),
     MapScroll(isize),
+    CompareScroll(usize, u64, isize),
+    ResultActivate(usize),
     Error(String),
 }
 
@@ -184,6 +226,15 @@ fn queue(event: Event) {
         }
         events.push_back(event);
     });
+}
+
+fn empty_tab_strip_press(kind: gdk::EventType, button: u32) -> glib::Propagation {
+    if kind == gdk::EventType::DoubleButtonPress && button == 1 {
+        queue(Event::Command(NEW));
+        glib::Propagation::Stop
+    } else {
+        glib::Propagation::Proceed
+    }
 }
 
 fn message(
@@ -293,28 +344,39 @@ struct SearchBar {
     mode: gtk::ComboBoxText,
     case: gtk::CheckButton,
     word: gtk::CheckButton,
+    buttons: Vec<(usize, gtk::Button)>,
+    folder_controls: gtk::Grid,
+    directory: gtk::Entry,
+    filters: gtk::Entry,
+    recursive: gtk::CheckButton,
+    hidden: gtk::CheckButton,
+    folder_visible: bool,
     visible: bool,
 }
 
 impl SearchBar {
     fn new() -> Self {
         let container = gtk::Grid::new();
-        container.set_row_spacing(6);
+        container.set_row_spacing(8);
         container.set_column_spacing(8);
         container.set_margin_start(8);
         container.set_margin_end(8);
-        container.set_margin_top(6);
-        container.set_margin_bottom(6);
+        container.set_margin_top(8);
+        container.set_margin_bottom(8);
         let query = gtk::Entry::new();
         query.set_placeholder_text(Some("Find text or expression"));
         query.set_tooltip_text(Some("Find text or expression"));
         query.set_max_length(32768);
         query.set_hexpand(true);
+        query.set_has_frame(true);
+        query.set_width_chars(18);
         query.connect_activate(|_| queue(Event::Command(FIND_NEXT)));
         let replace = gtk::Entry::new();
         replace.set_placeholder_text(Some("Replace with"));
         replace.set_tooltip_text(Some("Replacement text; regex captures use $1 or ${name}"));
         replace.set_max_length(32768);
+        replace.set_hexpand(true);
+        replace.set_has_frame(true);
         replace.connect_activate(|_| queue(Event::Command(REPLACE)));
         let mode = gtk::ComboBoxText::new();
         for label in ["Normal", "Extended (\\n, \\t)", "Regex ($1 captures)"] {
@@ -323,22 +385,79 @@ impl SearchBar {
         mode.set_active(Some(0));
         let case = gtk::CheckButton::with_label("Match case");
         let word = gtk::CheckButton::with_label("Whole word");
-        container.attach(&query, 0, 0, 1, 1);
-        container.attach(&replace, 0, 1, 1, 1);
-        container.attach(&mode, 1, 0, 2, 1);
-        container.attach(&case, 1, 1, 1, 1);
-        container.attach(&word, 2, 1, 1, 1);
-        for (label, command, x, y) in [
-            ("Previous", FIND_PREVIOUS, 3, 0),
-            ("Next", FIND_NEXT, 4, 0),
-            ("Replace", REPLACE, 3, 1),
-            ("Replace all", REPLACE_ALL, 4, 1),
-            ("Close", SEARCH_CLOSE, 5, 0),
+        for (row, label, target) in [
+            (0, "_Find:", query.upcast_ref::<gtk::Widget>()),
+            (1, "_Replace:", replace.upcast_ref::<gtk::Widget>()),
+            (2, "_Mode:", mode.upcast_ref::<gtk::Widget>()),
         ] {
-            let button = gtk::Button::with_label(label);
-            button.connect_clicked(move |_| queue(Event::Command(command)));
-            container.attach(&button, x, y, 1, 1);
+            let label = gtk::Label::with_mnemonic(label);
+            label.set_xalign(0.0);
+            label.set_mnemonic_widget(Some(target));
+            container.attach(&label, 0, row, 1, 1);
         }
+        container.attach(&query, 1, 0, 1, 1);
+        container.attach(&replace, 1, 1, 1, 1);
+        let options = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        options.pack_start(&mode, false, false, 0);
+        options.pack_start(&case, false, false, 0);
+        options.pack_start(&word, false, false, 0);
+        container.attach(&options, 1, 2, 2, 1);
+        let navigation = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let replacements = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let all = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        container.attach(&navigation, 2, 0, 1, 1);
+        container.attach(&replacements, 2, 1, 1, 1);
+        container.attach(&all, 1, 3, 2, 1);
+        let mut buttons = Vec::new();
+        for (label, command, row) in [
+            ("Previous", FIND_PREVIOUS, &navigation),
+            ("Next", FIND_NEXT, &navigation),
+            ("Close", SEARCH_CLOSE, &navigation),
+            ("Replace", REPLACE, &replacements),
+            ("Replace all", REPLACE_ALL, &replacements),
+            ("Find all: current document", FIND_ALL_CURRENT, &all),
+            ("Find all: all open documents", FIND_ALL_OPEN, &all),
+        ] {
+            let button = action_button(label, command);
+            row.pack_start(&button, false, false, 0);
+            buttons.push((command, button));
+        }
+        let folder_controls = gtk::Grid::new();
+        folder_controls.set_column_spacing(8);
+        folder_controls.set_row_spacing(8);
+        let directory = gtk::Entry::new();
+        directory.set_hexpand(true);
+        directory.set_placeholder_text(Some("Folder to search"));
+        directory.set_tooltip_text(Some("Search files on disk, not unsaved tab contents"));
+        let filters = gtk::Entry::new();
+        filters.set_text("*");
+        filters.set_tooltip_text(Some(
+            "File glob filters, for example *.rs;*.txt;!generated*",
+        ));
+        let recursive = gtk::CheckButton::with_label("Include subfolders");
+        recursive.set_active(true);
+        let hidden = gtk::CheckButton::with_label("Include hidden files");
+        for (row, caption, field) in [(0, "_Folder:", &directory), (1, "File _filters:", &filters)]
+        {
+            let label = gtk::Label::with_mnemonic(caption);
+            label.set_xalign(0.0);
+            label.set_mnemonic_widget(Some(field));
+            folder_controls.attach(&label, 0, row, 1, 1);
+            folder_controls.attach(field, 1, row, 1, 1);
+        }
+        for (row, label, command) in [
+            (0, "Choose folder...", FIND_FOLDER),
+            (1, "Find in files", FIND_FILES_RUN),
+        ] {
+            let button = action_button(label, command);
+            folder_controls.attach(&button, 2, row, 1, 1);
+            buttons.push((command, button));
+        }
+        let options = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        options.pack_start(&recursive, false, false, 0);
+        options.pack_start(&hidden, false, false, 0);
+        folder_controls.attach(&options, 1, 2, 2, 1);
+        container.attach(&folder_controls, 0, 4, 3, 1);
         Self {
             container,
             query,
@@ -346,8 +465,121 @@ impl SearchBar {
             mode,
             case,
             word,
+            buttons,
+            folder_controls,
+            directory,
+            filters,
+            recursive,
+            hidden,
+            folder_visible: false,
             visible: false,
         }
+    }
+}
+
+fn action_button(label: &str, command: usize) -> gtk::Button {
+    let button = gtk::Button::with_label(label);
+    button.set_relief(gtk::ReliefStyle::Normal);
+    button.set_tooltip_text(Some(label));
+    button.connect_clicked(move |_| queue(Event::Command(command)));
+    button
+}
+
+struct SearchTask {
+    rx: mpsc::Receiver<Result<SearchResults>>,
+    cancelled: Arc<AtomicBool>,
+    discard: bool,
+}
+impl Drop for SearchTask {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+struct ResultPanel {
+    container: gtk::Box,
+    title: gtk::Label,
+    editor: Editor,
+    buttons: Vec<(usize, gtk::Button)>,
+    visible: bool,
+    data: Option<SearchResults>,
+    links: Vec<ResultLink>,
+    current: Option<usize>,
+    job: Option<SearchTask>,
+}
+impl ResultPanel {
+    fn new() -> Result<Self> {
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        header.set_margin_start(8);
+        header.set_margin_end(8);
+        header.set_margin_top(4);
+        header.set_margin_bottom(4);
+        let title = gtk::Label::new(Some("Search results"));
+        title.set_xalign(0.0);
+        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        title.set_width_chars(16);
+        title.set_max_width_chars(40);
+        header.pack_start(&title, true, true, 0);
+        let mut buttons = Vec::new();
+        for (label, command) in [
+            ("Previous", RESULTS_PREVIOUS),
+            ("Next", RESULTS_NEXT),
+            ("Cancel", RESULTS_CANCEL),
+            ("Clear", RESULTS_CLEAR),
+            ("Close", RESULTS_CLOSE),
+        ] {
+            let button = action_button(label, command);
+            if matches!(command, RESULTS_PREVIOUS | RESULTS_NEXT | RESULTS_CANCEL) {
+                button.set_sensitive(false);
+            }
+            header.pack_start(&button, false, false, 0);
+            buttons.push((command, button));
+        }
+        container.pack_start(&header, false, false, 0);
+        let editor = Editor::new()?;
+        editor.widget().set_size_request(-1, 90);
+        editor.widget().drag_dest_unset();
+        editor.set_read_only_text("Use Find All to search the current document or all open tabs.\nDouble-click a result or press Enter to navigate. F4 / Shift+F4: next / previous match.\n")?;
+        editor.connect_notify(|notification| {
+            if notification.code == SCN_DOUBLECLICK && notification.position >= 0 {
+                queue(Event::ResultActivate(notification.position as usize));
+            }
+        });
+        editor.widget().connect_key_press_event(|_, event| {
+            if !event
+                .state()
+                .intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::MOD1_MASK)
+            {
+                let command = match event.keyval() {
+                    gdk::keys::constants::Return | gdk::keys::constants::KP_Enter => {
+                        Some(RESULTS_ACTIVATE)
+                    }
+                    gdk::keys::constants::Escape => Some(RESULTS_CLOSE),
+                    _ => None,
+                };
+                if let Some(command) = command {
+                    queue(Event::Command(command));
+                    return glib::Propagation::Stop;
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        container.pack_start(editor.widget(), true, true, 0);
+        Ok(Self {
+            container,
+            title,
+            editor,
+            buttons,
+            visible: false,
+            data: None,
+            links: Vec::new(),
+            current: None,
+            job: None,
+        })
+    }
+    fn has_focus(&self) -> bool {
+        self.editor.widget().has_focus()
     }
 }
 
@@ -367,7 +599,9 @@ struct CompareResult {
     right: u64,
     left_rev: u64,
     right_rev: u64,
-    result: Result<Vec<Difference>>,
+    generation: u64,
+    options: String,
+    result: Result<Comparison>,
 }
 struct JsonResult {
     document: u64,
@@ -385,14 +619,17 @@ struct App {
     window: gtk::Window,
     menu: gtk::MenuBar,
     tabs: gtk::Notebook,
-    tab_ids: Rc<RefCell<Vec<u64>>>,
+    tab_width: Rc<Cell<i32>>,
     status: gtk::Label,
     search: SearchBar,
+    content: gtk::Paned,
+    results: ResultPanel,
     tree: gtk::TreeView,
     tree_store: gtk::TreeStore,
     tree_scroll: gtk::ScrolledWindow,
     map_box: gtk::EventBox,
     editors: [Editor; 2],
+    pane_frames: [gtk::Overlay; 2],
     pane_ids: [Rc<Cell<u64>>; 2],
     scratch: Editor,
     map: Editor,
@@ -406,6 +643,13 @@ struct App {
     palette: Palette,
     theme: String,
     editor_font: EditorFont,
+    show_symbols: ShowSymbols,
+    symbol_items: Vec<(usize, gtk::CheckMenuItem)>,
+    monitor_item: Option<gtk::CheckMenuItem>,
+    monitor_files: bool,
+    monitor: Monitor,
+    monitor_busy: bool,
+    last_monitor: Instant,
     desktop_settings: Option<gio::Settings>,
     fallback_dark: bool,
     map_visible: bool,
@@ -420,6 +664,15 @@ struct App {
     differences: Vec<Difference>,
     difference: usize,
     comparing: bool,
+    compare_options: CompareOptions,
+    compare_generation: u64,
+    compare_pair: Option<[u64; 2]>,
+    compare_selection: Option<[std::ops::Range<usize>; 2]>,
+    compare_leading: [usize; 2],
+    compare_top: [usize; 2],
+    compare_native_row: [usize; 2],
+    compare_row: usize,
+    compare_aligned: bool,
     compare_rx: Option<mpsc::Receiver<CompareResult>>,
     compare_due: Option<Instant>,
     compare_jump: bool,
@@ -477,24 +730,62 @@ impl App {
         tabs.set_scrollable(true);
         tabs.set_show_border(false);
         tabs.set_can_focus(false);
-        let tab_ids = Rc::new(RefCell::new(Vec::<u64>::new()));
-        let selected_ids = tab_ids.clone();
-        tabs.connect_switch_page(move |_, _, position| {
-            if !TABS_UPDATING.with(Cell::get) {
-                if let Some(id) = selected_ids.borrow().get(position as usize).copied() {
-                    queue(Event::Tab(id));
-                } else {
-                    queue(Event::Error(
-                        "The selected tab is no longer in the document list.".into(),
-                    ));
-                }
+        tabs.set_hexpand(false);
+        tabs.connect_switch_page(move |_, page, _| {
+            if !TABS_UPDATING.with(Cell::get)
+                && let Ok(id) = page.widget_name().parse::<u64>()
+            {
+                queue(Event::Tab(id));
             }
         });
-        root.pack_start(&tabs, false, false, 0);
+        tabs.connect_page_reordered(|_, page, position| {
+            if !TABS_UPDATING.with(Cell::get)
+                && let Ok(id) = page.widget_name().parse::<u64>()
+            {
+                queue(Event::MoveTab(id, position as usize));
+            }
+        });
+        let empty_strip = gtk::EventBox::new();
+        empty_strip.set_visible_window(false);
+        empty_strip.set_size_request(48, -1);
+        empty_strip.set_tooltip_text(Some(
+            "Double-click this empty tab-strip area to create a new document",
+        ));
+        empty_strip.add_events(gdk::EventMask::BUTTON_PRESS_MASK);
+        empty_strip.connect_button_press_event(|_, event| {
+            empty_tab_strip_press(event.event_type(), event.button())
+        });
+        let tab_strip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        tab_strip.pack_start(&tabs, false, false, 0);
+        tab_strip.pack_start(&empty_strip, true, true, 0);
+        let tab_width = Rc::new(Cell::new(1));
+        let width = tab_width.clone();
+        let notebook = tabs.clone();
+        let blank = empty_strip.clone();
+        tab_strip.connect_size_allocate(move |_, allocation| {
+            // Scrollable notebooks request only one tab; retain full headers when they fit.
+            let width = width.get().min((allocation.width() - 48).max(1));
+            notebook.size_allocate(&gtk::Allocation::new(
+                allocation.x(),
+                allocation.y(),
+                width,
+                allocation.height(),
+            ));
+            blank.size_allocate(&gtk::Allocation::new(
+                allocation.x() + width,
+                allocation.y(),
+                (allocation.width() - width).max(1),
+                allocation.height(),
+            ));
+        });
+        root.pack_start(&tab_strip, false, false, 0);
         let search = SearchBar::new();
         root.pack_start(&search.container, false, false, 0);
         let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        root.pack_start(&body, true, true, 0);
+        let content = gtk::Paned::new(gtk::Orientation::Vertical);
+        content.set_wide_handle(true);
+        content.pack1(&body, true, false);
+        root.pack_start(&content, true, true, 0);
         let tree_store = gtk::TreeStore::new(&[String::static_type(), u32::static_type()]);
         let tree = gtk::TreeView::with_model(&tree_store);
         tree.set_headers_visible(false);
@@ -550,8 +841,39 @@ impl App {
             });
         }
         let split = gtk::Paned::new(gtk::Orientation::Horizontal);
-        split.pack1(editors[0].widget(), true, false);
-        split.pack2(editors[1].widget(), true, false);
+        let pane_frames = [gtk::Overlay::new(), gtk::Overlay::new()];
+        for (pane, frame) in pane_frames.iter().enumerate() {
+            let background = gtk::EventBox::new();
+            background.set_size_request(80, 60);
+            background.add_events(gdk::EventMask::SCROLL_MASK | gdk::EventMask::SMOOTH_SCROLL_MASK);
+            let id = pane_ids[pane].clone();
+            background.connect_scroll_event(move |_, event| {
+                let delta = match event.direction() {
+                    gdk::ScrollDirection::Up => -3,
+                    gdk::ScrollDirection::Down => 3,
+                    _ => (event.delta().1 * 3.0).round() as isize,
+                };
+                queue(Event::CompareScroll(pane, id.get(), delta));
+                glib::Propagation::Stop
+            });
+            frame.add(&background);
+            frame.add_overlay(editors[pane].widget());
+            // Leading comparison rows must not increase the window's minimum height.
+            frame.connect_get_child_position(|frame, child| {
+                let height = frame.allocated_height().max(1);
+                if child.margin_top() >= height {
+                    child.set_margin_top(height - 1);
+                }
+                Some(gdk::Rectangle::new(
+                    0,
+                    0,
+                    frame.allocated_width().max(1),
+                    height,
+                ))
+            });
+        }
+        split.pack1(&pane_frames[0], true, false);
+        split.pack2(&pane_frames[1], true, false);
         body.pack_start(&split, true, true, 0);
         let scratch = Editor::new()?;
         let map = Editor::new()?;
@@ -590,6 +912,8 @@ impl App {
             glib::Propagation::Stop
         });
         body.pack_end(&map_box, false, false, 0);
+        let results = ResultPanel::new()?;
+        content.pack2(&results.container, false, false);
         let status = gtk::Label::new(None);
         status.set_xalign(0.0);
         status.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -628,14 +952,17 @@ impl App {
             window,
             menu,
             tabs,
-            tab_ids,
+            tab_width,
             status,
             search,
+            content,
+            results,
             tree,
             tree_store,
             tree_scroll,
             map_box,
             editors,
+            pane_frames,
             pane_ids,
             scratch,
             map,
@@ -649,6 +976,13 @@ impl App {
             palette: Palette::new(false),
             theme: session.theme,
             editor_font: session.editor_font,
+            show_symbols: session.show_symbols,
+            symbol_items: Vec::new(),
+            monitor_item: None,
+            monitor_files: session.monitor_files,
+            monitor: Monitor::new(),
+            monitor_busy: false,
+            last_monitor: Instant::now(),
             desktop_settings,
             fallback_dark,
             map_visible: false,
@@ -663,6 +997,15 @@ impl App {
             differences: Vec::new(),
             difference: 0,
             comparing: false,
+            compare_options: session.compare_options,
+            compare_generation: 0,
+            compare_pair: None,
+            compare_selection: None,
+            compare_leading: [0; 2],
+            compare_top: [0; 2],
+            compare_native_row: [0; 2],
+            compare_row: 0,
+            compare_aligned: false,
             compare_rx: None,
             compare_due: None,
             compare_jump: false,
@@ -683,7 +1026,16 @@ impl App {
             app.add_document(snapshot)?;
         }
         if !app.documents.is_empty() {
-            app.switch(session.active.min(app.documents.len() - 1))?;
+            let active = app.documents[session.active.min(app.documents.len() - 1)]
+                .snapshot
+                .id;
+            app.partition_tabs();
+            let index = app
+                .documents
+                .iter()
+                .position(|doc| doc.snapshot.id == active)
+                .unwrap();
+            app.switch(index)?;
         }
         Ok(app)
     }
@@ -698,6 +1050,62 @@ impl App {
     fn editor(&self) -> Editor {
         self.editors[self.focused].clone()
     }
+    fn effective_wrap(&self) -> bool {
+        self.wrap && !(self.comparing && self.compare_options.align)
+    }
+    fn pane_documents(&self) -> (u64, Option<u64>) {
+        (
+            self.documents[self.primary].snapshot.id,
+            self.secondary
+                .map(|index| self.documents[index].snapshot.id),
+        )
+    }
+    fn remap_panes(&mut self, ids: (u64, Option<u64>)) {
+        self.primary = self
+            .documents
+            .iter()
+            .position(|doc| doc.snapshot.id == ids.0)
+            .unwrap();
+        self.secondary = ids
+            .1
+            .and_then(|id| self.documents.iter().position(|doc| doc.snapshot.id == id));
+    }
+    fn partition_tabs(&mut self) {
+        let ids = self.pane_documents();
+        self.documents.sort_by_key(|doc| !doc.snapshot.pinned);
+        self.remap_panes(ids);
+        self.update_tabs();
+        self.touch();
+    }
+    fn move_tab(&mut self, id: u64, requested: usize) -> Result<()> {
+        let Some(from) = self.documents.iter().position(|doc| doc.snapshot.id == id) else {
+            return Ok(());
+        };
+        let pinned: Vec<_> = self
+            .documents
+            .iter()
+            .map(|doc| doc.snapshot.pinned)
+            .collect();
+        let target = crate::tabs::move_target(&pinned, from, requested.min(pinned.len() - 1))?;
+        let ids = self.pane_documents();
+        let document = self.documents.remove(from);
+        self.documents.insert(target, document);
+        self.remap_panes(ids);
+        self.update_tabs();
+        self.touch();
+        Ok(())
+    }
+    fn pin_tab(&mut self, id: u64) {
+        if let Some(doc) = self.documents.iter_mut().find(|doc| doc.snapshot.id == id) {
+            doc.snapshot.pinned = !doc.snapshot.pinned;
+            self.partition_tabs();
+        }
+    }
+    fn document_dirty(&self, index: usize) -> bool {
+        let doc = &self.documents[index];
+        self.scratch.attach(&doc.handle);
+        doc.base_dirty || doc.metadata_dirty || self.scratch.send(SCI_GETMODIFY, 0, 0) != 0
+    }
     fn touch(&mut self) {
         self.revision += 1;
     }
@@ -707,14 +1115,20 @@ impl App {
     }
     fn layout(&self) {
         self.search.container.set_visible(self.search.visible);
+        self.search
+            .folder_controls
+            .set_visible(self.search.folder_visible);
         self.tree_scroll.set_visible(self.tree_visible);
         self.map_box.set_visible(self.map_visible);
         self.editors[1]
             .widget()
             .set_visible(self.secondary.is_some());
+        self.pane_frames[1].set_visible(self.secondary.is_some());
+        self.results.container.set_visible(self.results.visible);
     }
 
-    fn make_menu(&self) {
+    fn make_menu(&mut self) {
+        self.symbol_items.clear();
         for child in self.menu.children() {
             self.menu.remove(&child);
         }
@@ -727,6 +1141,9 @@ impl App {
                     (SAVE, "Save    Ctrl+S"),
                     (SAVE_AS, "Save as...    Ctrl+Shift+S"),
                     (CLOSE, "Close tab    Ctrl+W"),
+                    (TAB_PIN, "Pin / unpin tab"),
+                    (TAB_LEFT, "Move tab left    Ctrl+Shift+PageUp"),
+                    (TAB_RIGHT, "Move tab right    Ctrl+Shift+PageDown"),
                     (0, ""),
                     (EXIT, "Quit (keep session)"),
                 ],
@@ -752,9 +1169,22 @@ impl App {
                 "_Search",
                 &[
                     (FIND, "Find / replace    Ctrl+F / Ctrl+H"),
+                    (FIND_FILES, "Find in files...    Ctrl+Shift+F"),
                     (FIND_NEXT, "Find next    F3"),
                     (FIND_PREVIOUS, "Find previous    Shift+F3"),
                     (REPLACE_ALL, "Replace all"),
+                    (
+                        FIND_ALL_CURRENT,
+                        "Find all in current document    Ctrl+Alt+Enter",
+                    ),
+                    (
+                        FIND_ALL_OPEN,
+                        "Find all in all open documents    Ctrl+Shift+Enter",
+                    ),
+                    (0, ""),
+                    (RESULTS_TOGGLE, "Search results panel    Ctrl+Alt+R"),
+                    (RESULTS_NEXT, "Next search result    F4"),
+                    (RESULTS_PREVIOUS, "Previous search result    Shift+F4"),
                 ],
             ),
             (
@@ -775,6 +1205,10 @@ impl App {
                 "_Tools",
                 &[
                     (COMPARE, "Compare active tab with next tab"),
+                    (COMPARE_SELECTION, "Compare selected lines in both panes"),
+                    (COMPARE_CLIPBOARD, "Compare with clipboard"),
+                    (COMPARE_SAVED, "Compare with last-saved file"),
+                    (COMPARE_SETTINGS, "Compare options..."),
                     (DIFF_NEXT, "Next difference    F7"),
                     (DIFF_PREVIOUS, "Previous difference    Shift+F7"),
                     (COMPARE_CLEAR, "Clear compare"),
@@ -790,6 +1224,41 @@ impl App {
             let menu = submenu(&self.menu, label);
             for (id, label) in *items {
                 menu_item(&menu, *id, label);
+            }
+            if *label == "_View" {
+                let item = gtk::CheckMenuItem::with_label("Automatically reload external changes");
+                item.set_active(self.monitor_files);
+                item.connect_activate(|_| {
+                    if !SYMBOLS_UPDATING.with(Cell::get) {
+                        queue(Event::Command(MONITOR_FILES));
+                    }
+                });
+                menu.append(&item);
+                self.monitor_item = Some(item);
+                let symbols = submenu(&menu, "Show _symbols");
+                for (id, label) in [
+                    (SYMBOL_SPACE, "Show space and tab"),
+                    (SYMBOL_EOL, "Show end of line"),
+                    (SYMBOL_NONPRINTING, "Show non-printing characters"),
+                    (SYMBOL_CONTROLS, "Show control characters & Unicode EOL"),
+                    (SYMBOL_ALL, "Show all characters"),
+                    (0, ""),
+                    (SYMBOL_INDENT, "Show indent guide"),
+                    (SYMBOL_WRAP, "Show wrap symbol"),
+                ] {
+                    if id == 0 {
+                        menu_item(&symbols, 0, "");
+                        continue;
+                    }
+                    let item = gtk::CheckMenuItem::with_label(label);
+                    item.connect_activate(move |_| {
+                        if !SYMBOLS_UPDATING.with(Cell::get) {
+                            queue(Event::Command(id));
+                        }
+                    });
+                    symbols.append(&item);
+                    self.symbol_items.push((id, item));
+                }
             }
             if *label == "_Edit" {
                 let cases = submenu(&menu, "Case conversion");
@@ -888,6 +1357,31 @@ impl App {
         let help = submenu(&self.menu, "_Help");
         menu_item(&help, ABOUT, "About / keyboard help");
         self.menu.show_all();
+        self.update_symbol_checks();
+    }
+
+    fn update_symbol_checks(&self) {
+        SYMBOLS_UPDATING.with(|flag| flag.set(true));
+        for (id, item) in &self.symbol_items {
+            let checked = match *id {
+                SYMBOL_SPACE => self.show_symbols.whitespace,
+                SYMBOL_EOL => self.show_symbols.eol,
+                SYMBOL_NONPRINTING => self.show_symbols.non_printing,
+                SYMBOL_CONTROLS => self.show_symbols.controls,
+                SYMBOL_ALL => self.show_symbols.all_characters(),
+                SYMBOL_INDENT => self.show_symbols.indent_guides,
+                SYMBOL_WRAP => self.show_symbols.wrap_markers,
+                _ => unreachable!(),
+            };
+            item.set_active(checked);
+        }
+        SYMBOLS_UPDATING.with(|flag| flag.set(false));
+    }
+    fn apply_symbols(&self) {
+        for editor in &self.editors {
+            editor.show_symbols(self.show_symbols, self.palette);
+        }
+        self.update_symbol_checks();
     }
 
     fn apply_theme(&mut self) {
@@ -934,6 +1428,8 @@ impl App {
             }
             self.configure_map();
         }
+        self.apply_symbols();
+        self.theme_results();
     }
 
     fn choose_editor_font(&self) -> Result<Option<EditorFont>> {
@@ -962,6 +1458,9 @@ impl App {
             editor.send(SCI_SETZOOM, 0, 0);
         }
         self.apply_theme();
+        if self.compare_aligned {
+            self.align_compare_row(self.compare_row);
+        }
         self.touch();
         self.note(format!(
             "Default editor font: {}, {} pt.",
@@ -1018,6 +1517,7 @@ impl App {
             eol: Eol::Lf,
             language: "Plain text".into(),
             dirty: false,
+            pinned: false,
             disk_hash: None,
             caret: 0,
         })
@@ -1026,6 +1526,9 @@ impl App {
     fn switch(&mut self, index: usize) -> Result<()> {
         if index >= self.documents.len() {
             return Err("This tab is no longer open.".into());
+        }
+        if self.comparing && index != self.index() {
+            self.clear_compare();
         }
         if self.focused == 1 && self.secondary.is_some() {
             self.secondary = Some(index);
@@ -1058,11 +1561,12 @@ impl App {
                     &self.editor_font,
                 )?;
                 self.editors[pane].send(SCI_SETEOLMODE, doc.snapshot.eol.scintilla(), 0);
-                self.editors[pane].send(SCI_SETWRAPMODE, self.wrap as usize, 0);
+                self.editors[pane].send(SCI_SETWRAPMODE, self.effective_wrap() as usize, 0);
             } else {
                 self.pane_ids[pane].set(0);
             }
         }
+        self.apply_symbols();
         self.configure_map();
         self.layout();
         Ok(())
@@ -1123,13 +1627,12 @@ impl App {
 
     fn update_tabs(&self) {
         TABS_UPDATING.with(|flag| flag.set(true));
-        *self.tab_ids.borrow_mut() = self.documents.iter().map(|doc| doc.snapshot.id).collect();
         while self.tabs.n_pages() > 0 {
             self.tabs.remove_page(Some(0));
         }
         for doc in &self.documents {
             let title = format!(
-                "{}{}{}",
+                "{}{}{}{}",
                 if self
                     .secondary
                     .is_some_and(|i| self.documents[i].snapshot.id == doc.snapshot.id)
@@ -1138,6 +1641,7 @@ impl App {
                 } else {
                     ""
                 },
+                if doc.snapshot.pinned { "[Pinned] " } else { "" },
                 doc.snapshot.title,
                 if doc.snapshot.dirty { " *" } else { "" }
             );
@@ -1156,11 +1660,48 @@ impl App {
             close.connect_clicked(move |_| queue(Event::CloseTab(id)));
             row.pack_end(&close, false, false, 0);
             row.show_all();
+            let tab = gtk::EventBox::new();
+            tab.set_visible_window(false);
+            tab.add(&row);
+            let pinned = doc.snapshot.pinned;
+            tab.connect_button_press_event(move |tab, event| {
+                if event.button() != 3 {
+                    return glib::Propagation::Proceed;
+                }
+                let menu = gtk::Menu::new();
+                menu.set_attach_widget(Some(tab));
+                menu.connect_selection_done(|menu| unsafe { menu.destroy() });
+                for (label, action) in [
+                    (if pinned { "Unpin tab" } else { "Pin tab" }, 0),
+                    ("Move tab left", 1),
+                    ("Move tab right", 2),
+                ] {
+                    let item = gtk::MenuItem::with_label(label);
+                    item.connect_activate(move |_| {
+                        queue(match action {
+                            0 => Event::PinTab(id),
+                            1 => Event::StepTab(id, true),
+                            _ => Event::StepTab(id, false),
+                        })
+                    });
+                    menu.append(&item);
+                }
+                menu.show_all();
+                menu.popup_at_pointer(Some(event));
+                glib::Propagation::Stop
+            });
+            tab.show_all();
             let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            self.tabs.append_page(&page, Some(&row));
+            page.set_widget_name(&id.to_string());
+            self.tabs.append_page(&page, Some(&tab));
+            self.tabs.set_tab_reorderable(&page, true);
             page.show();
         }
         self.tabs.set_current_page(Some(self.index() as u32));
+        self.tabs.show();
+        self.tabs.set_scrollable(false);
+        self.tab_width.set(self.tabs.preferred_width().1.max(1));
+        self.tabs.set_scrollable(true);
         TABS_UPDATING.with(|flag| flag.set(false));
         if let Some(doc) = self.documents.get(self.index()) {
             self.window.set_title(&format!(
@@ -1179,6 +1720,10 @@ impl App {
         let editor = self.editor();
         let line = editor.send(SCI_LINEFROMPOSITION, editor.position(), 0) + 1;
         let column = editor.send(SCI_GETCOLUMN, editor.position(), 0) + 1;
+        let characters = match editor.character_counts() {
+            Ok(counts) => counts.to_string(),
+            Err(error) => format!("Character count unavailable: {error}"),
+        };
         let state = if self.recovery_error.is_some() {
             "RECOVERY FAILED"
         } else if self.recovery_busy {
@@ -1189,7 +1734,7 @@ impl App {
             "Recovery pending"
         };
         let text = format!(
-            "Ln {line}, Col {column}   |   {} selections   |   {}   |   {}   {}   |   {state}   {}",
+            "Ln {line}, Col {column}   |   {characters}   |   {} selections   |   {}   |   {}   {}   |   {state}   {}",
             editor.send(SCI_GETSELECTIONS, 0, 0),
             self.languages[doc.language].name,
             doc.snapshot.encoding.label(),
@@ -1241,6 +1786,7 @@ impl App {
             eol,
             language: self.languages[language].name.clone(),
             dirty: false,
+            pinned: false,
             disk_hash: Some(session::fingerprint(&bytes)),
             caret: 0,
         })?;
@@ -1366,7 +1912,7 @@ impl App {
 
     fn close_document(&mut self) -> Result<()> {
         let index = self.index();
-        if self.documents[index].snapshot.dirty {
+        if self.document_dirty(index) {
             match message(
                 Some(&self.window),
                 "Save this document before closing its tab?\n\nDiscard removes its edits and recovery copy. Close the app instead to keep every tab without choosing filenames.",
@@ -1394,7 +1940,17 @@ impl App {
         if self.documents.len() == 1 {
             self.new_document()?;
         }
-        self.documents.remove(index);
+        let closed = self.documents.remove(index);
+        if self
+            .results
+            .data
+            .as_ref()
+            .is_some_and(|data| data.files.iter().any(|file| file.id == closed.snapshot.id))
+        {
+            self.results
+                .title
+                .set_text("A result document was closed - rerun Find All to refresh.");
+        }
         self.primary = if self.primary > index {
             self.primary - 1
         } else {
@@ -1450,6 +2006,9 @@ impl App {
             active: self.index(),
             theme: self.theme.clone(),
             editor_font: self.editor_font.clone(),
+            show_symbols: self.show_symbols,
+            monitor_files: self.monitor_files,
+            compare_options: self.compare_options.clone(),
             custom_languages: self
                 .languages
                 .iter()
@@ -1457,6 +2016,181 @@ impl App {
                 .collect(),
             completion_api: self.completion_api.clone(),
         })
+    }
+
+    fn poll_monitor(&mut self) {
+        while let Ok(changes) = self.monitor.rx.try_recv() {
+            self.monitor_busy = false;
+            if self.monitor_files {
+                for change in changes {
+                    if let Err(error) = self.apply_external_change(change) {
+                        self.note(format!("External file monitoring: {error}"));
+                    }
+                }
+            }
+        }
+        if !self.monitor_files
+            || self.monitor_busy
+            || self.last_monitor.elapsed() < Duration::from_secs(1)
+        {
+            return;
+        }
+        self.last_monitor = Instant::now();
+        let requests = self
+            .documents
+            .iter()
+            .filter_map(|doc| {
+                Some(monitor::Request {
+                    id: doc.snapshot.id,
+                    path: doc.snapshot.path.clone()?,
+                    known_hash: doc.snapshot.disk_hash,
+                    encoding: doc.snapshot.encoding.clone(),
+                })
+            })
+            .collect();
+        match self.monitor.submit(requests) {
+            Ok(()) => self.monitor_busy = true,
+            Err(error) => self.note(format!("External file monitoring: {error}")),
+        }
+    }
+
+    fn apply_external_change(&mut self, change: monitor::Change) -> Result<()> {
+        let Some(index) = self.documents.iter().position(|doc| {
+            doc.snapshot.id == change.id
+                && doc.snapshot.path.as_ref() == Some(&change.path)
+                && doc.snapshot.disk_hash == change.baseline_hash
+        }) else {
+            return Ok(());
+        };
+        let snapshot = change.result?;
+        if self.document_dirty(index)
+            && !confirm(
+                &self.window,
+                &format!(
+                    "{} changed outside rstpd.\n\nReload it and discard this tab's unsaved edits? Cancel keeps your edits and the original save-conflict check.",
+                    change.path.display()
+                ),
+            )
+        {
+            self.note("External change not reloaded; unsaved edits are preserved.");
+            return Ok(());
+        }
+        let views: Vec<_> = self
+            .editors
+            .iter()
+            .enumerate()
+            .filter(|(pane, _)| self.pane_ids[*pane].get() == change.id)
+            .map(|(pane, editor)| {
+                (
+                    pane,
+                    (0..editor.send(SCI_GETSELECTIONS, 0, 0).max(1) as usize)
+                        .map(|selection| {
+                            (
+                                editor.send(SCI_GETSELECTIONNANCHOR, selection, 0).max(0) as usize,
+                                editor.send(SCI_GETSELECTIONNCARET, selection, 0).max(0) as usize,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    editor.send(SCI_GETMAINSELECTION, 0, 0).max(0) as usize,
+                    editor.send(SCI_GETFIRSTVISIBLELINE, 0, 0).max(0) as usize,
+                    editor.send(SCI_GETXOFFSET, 0, 0),
+                )
+            })
+            .collect();
+        let boundary = |position: usize| {
+            let mut position = position.min(snapshot.text.len());
+            while !snapshot.text.is_char_boundary(position) {
+                position -= 1;
+            }
+            position
+        };
+        self.scratch.attach(&self.documents[index].handle);
+        self.scratch.set_text(&snapshot.text)?;
+        let doc = &mut self.documents[index];
+        doc.snapshot.encoding = snapshot.encoding;
+        doc.snapshot.eol = snapshot.eol;
+        doc.snapshot.disk_hash = Some(snapshot.hash);
+        doc.snapshot.dirty = false;
+        doc.snapshot.caret = boundary(doc.snapshot.caret);
+        doc.base_dirty = false;
+        doc.metadata_dirty = false;
+        doc.revision += 1;
+        doc.styled_revision = None;
+        doc.last_edit = Instant::now();
+        let selection_comparison = self.compare_selection.is_some()
+            && self
+                .compare_pair
+                .is_some_and(|pair| pair.contains(&change.id));
+        self.invalidate_tools(change.id);
+        self.refresh_views()?;
+        for (pane, selections, main, first, horizontal) in views {
+            let editor = &self.editors[pane];
+            for (index, (anchor, caret)) in selections.into_iter().enumerate() {
+                editor.send(
+                    if index == 0 {
+                        SCI_SETSELECTION
+                    } else {
+                        SCI_ADDSELECTION
+                    },
+                    boundary(caret),
+                    boundary(anchor) as isize,
+                );
+            }
+            editor.send(
+                SCI_SETMAINSELECTION,
+                main.min(editor.send(SCI_GETSELECTIONS, 0, 0).max(1) as usize - 1),
+                0,
+            );
+            editor.send(SCI_SETFIRSTVISIBLELINE, first, 0);
+            editor.send(SCI_SETXOFFSET, horizontal.max(0) as usize, 0);
+        }
+        self.touch();
+        self.update_tabs();
+        self.note(format!(
+            "Reloaded external changes: {}{}",
+            change.path.display(),
+            if selection_comparison {
+                ". Selection comparison ended; reselect lines to compare."
+            } else {
+                ""
+            }
+        ));
+        Ok(())
+    }
+
+    fn invalidate_tools(&mut self, id: u64) {
+        self.last_zero_match = None;
+        if self.results.data.as_ref().is_some_and(|data| {
+            data.files.iter().any(|file| {
+                file.id == id
+                    || file.source.as_ref().is_some_and(|source| {
+                        self.documents.iter().any(|doc| {
+                            doc.snapshot.id == id
+                                && doc.snapshot.path.as_ref() == Some(&source.path)
+                        })
+                    })
+            })
+        }) {
+            self.results
+                .title
+                .set_text("Document changed - rerun search to refresh its results.");
+        }
+        if self.json_document == Some(id) {
+            self.json_document = None;
+        }
+        if self.tree_visible && self.documents[self.index()].snapshot.id == id {
+            self.schedule_json();
+        }
+        if self.compare_pair.is_some_and(|pair| pair.contains(&id)) {
+            if self.compare_selection.is_some() {
+                self.clear_compare();
+                self.note("Selection comparison ended after a text change; reselect lines in both panes to compare again.");
+                return;
+            }
+            self.clear_compare_marks();
+            self.differences.clear();
+            self.compare_due = Some(Instant::now() + Duration::from_millis(350));
+        }
     }
 
     fn search_settings(&self) -> Result<Search> {
@@ -1485,6 +2219,60 @@ impl App {
         self.layout();
         self.search.query.grab_focus();
         self.search.query.select_region(0, -1);
+        Ok(())
+    }
+
+    fn choose_search_folder(&self) {
+        let dialog = gtk::FileChooserNative::new(
+            Some("Choose search folder"),
+            Some(&self.window),
+            gtk::FileChooserAction::SelectFolder,
+            Some("_Select"),
+            Some("_Cancel"),
+        );
+        dialog.set_local_only(true);
+        if !self.search.directory.text().is_empty() {
+            dialog.set_current_folder(Path::new(self.search.directory.text().as_str()));
+        }
+        if dialog.run() == gtk::ResponseType::Accept
+            && let Some(path) = dialog.filename()
+        {
+            self.search.directory.set_text(&path.to_string_lossy());
+        }
+        dialog.destroy();
+    }
+
+    fn start_find_files(&mut self) -> Result<()> {
+        if self.results.job.is_some() {
+            self.set_results_visible(true);
+            self.note("A search is still running. Cancel it before starting another search.");
+            return Ok(());
+        }
+        let query = self.search.query.text().to_string();
+        let search = self.search_settings()?;
+        let options = FolderOptions {
+            directory: PathBuf::from(self.search.directory.text().as_str()),
+            filters: self.search.filters.text().to_string(),
+            recursive: self.search.recursive.is_active(),
+            hidden: self.search.hidden.is_active(),
+        };
+        options.validate()?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let token = cancelled.clone();
+        let (tx, rx) = mpsc::channel();
+        self.prepare_find_results("Searching files on disk...\n")?;
+        std::thread::spawn(move || {
+            let _ = tx.send(folder_search::find_in_files(
+                &search, query, options, &token,
+            ));
+        });
+        self.results.job = Some(SearchTask {
+            rx,
+            cancelled,
+            discard: false,
+        });
+        self.result_message("Searching files on disk...");
+        self.update_result_buttons();
         Ok(())
     }
 
@@ -1566,13 +2354,428 @@ impl App {
         Ok(())
     }
 
+    fn theme_results(&self) {
+        let editor = &self.results.editor;
+        editor.theme(&self.languages[0], self.palette);
+        editor.send(SCI_SETMARGINWIDTHN, 0, 0);
+        editor.send(SCI_SETMARGINWIDTHN, 1, 0);
+        editor.send(SCI_SETWRAPMODE, 0, 0);
+        editor.send(SCI_SETCARETLINEVISIBLE, 1, 0);
+        editor.send(SCI_STYLESETFORE, 1, self.palette.accent as isize);
+        editor.send(SCI_STYLESETBOLD, 1, 1);
+        editor.send(SCI_STYLESETBOLD, 2, 1);
+        editor.send(SCI_INDICSETSTYLE, search_results::MATCH_INDICATOR, 7);
+        editor.send(
+            SCI_INDICSETFORE,
+            search_results::MATCH_INDICATOR,
+            self.palette.accent as isize,
+        );
+        editor.send(SCI_INDICSETALPHA, search_results::MATCH_INDICATOR, 75);
+        editor.send(
+            SCI_INDICSETOUTLINEALPHA,
+            search_results::MATCH_INDICATOR,
+            140,
+        );
+        editor.send(SCI_INDICSETUNDER, search_results::MATCH_INDICATOR, 1);
+    }
+    fn result_message(&mut self, message: &str) {
+        self.results.title.set_text(message);
+        self.results.title.set_tooltip_text(Some(message));
+        self.note(message);
+    }
+    fn set_results_visible(&mut self, visible: bool) {
+        let opening = visible && !self.results.visible;
+        self.results.visible = visible;
+        self.layout();
+        if opening {
+            self.content
+                .set_position((self.content.allocated_height() - 240).max(100));
+        }
+    }
+    fn update_result_buttons(&self) {
+        for (command, button) in &self.results.buttons {
+            let enabled = match *command {
+                RESULTS_NEXT | RESULTS_PREVIOUS => !self.results.links.is_empty(),
+                RESULTS_CANCEL => self.results.job.is_some(),
+                _ => true,
+            };
+            button.set_sensitive(enabled);
+        }
+        for (command, button) in &self.search.buttons {
+            if matches!(*command, FIND_ALL_CURRENT | FIND_ALL_OPEN | FIND_FILES_RUN) {
+                button.set_sensitive(self.results.job.is_none());
+            }
+        }
+    }
+    fn start_find_all(&mut self, all_open: bool) -> Result<()> {
+        if self.results.job.is_some() {
+            self.set_results_visible(true);
+            self.note("Find All is still running. Cancel it before starting another search.");
+            return Ok(());
+        }
+        if self.search.query.text().is_empty() {
+            self.show_search()?;
+            if self.search.query.text().is_empty() {
+                self.note("Enter a search expression, then choose Find All.");
+                return Ok(());
+            }
+        }
+        let query = self.search.query.text().to_string();
+        let search = self.search_settings()?;
+        let mut bytes = 0usize;
+        let mut inputs = Vec::new();
+        for (index, doc) in self.documents.iter().enumerate() {
+            if !all_open && index != self.index() {
+                continue;
+            }
+            self.scratch.attach(&doc.handle);
+            let length = self.scratch.length();
+            if length > core::MAX_TOOL_BYTES {
+                return Err(format!(
+                    "{} exceeds the 16 MiB search limit. No documents were skipped or searched.",
+                    doc.snapshot.title
+                ));
+            }
+            bytes += length;
+            if bytes > search_results::MAX_BATCH_BYTES {
+                return Err("Find All is limited to 64 MiB across open documents. Close some tabs or search the current document.".into());
+            }
+            let title = doc
+                .snapshot
+                .path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| doc.snapshot.title.clone());
+            inputs.push(SearchInput {
+                id: doc.snapshot.id,
+                revision: doc.revision,
+                title,
+                text: self.scratch.text()?,
+                tab_width: self.scratch.send(SCI_GETTABWIDTH, 0, 0).max(1) as usize,
+            });
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let token = cancelled.clone();
+        let (tx, rx) = mpsc::channel();
+        self.prepare_find_results("Searching open document snapshots...\n")?;
+        std::thread::spawn(move || {
+            let result = search_results::find_all(&search, query, inputs, &token);
+            let _ = tx.send(result);
+        });
+        self.results.job = Some(SearchTask {
+            rx,
+            cancelled,
+            discard: false,
+        });
+        self.result_message(if all_open {
+            "Searching all open documents..."
+        } else {
+            "Searching current document..."
+        });
+        self.update_result_buttons();
+        Ok(())
+    }
+    fn prepare_find_results(&mut self, message: &str) -> Result<()> {
+        self.results.editor.set_read_only_text(message)?;
+        self.results
+            .editor
+            .clear_indicator(search_results::MATCH_INDICATOR);
+        self.results.data = None;
+        self.results.links.clear();
+        self.results.current = None;
+        self.set_results_visible(true);
+        Ok(())
+    }
+    fn apply_find_results(&mut self, results: SearchResults) -> Result<()> {
+        let rendered = results.render();
+        self.results.editor.set_read_only_text(&rendered.text)?;
+        self.theme_results();
+        self.results.editor.highlight(&rendered.highlight)?;
+        self.results
+            .editor
+            .clear_indicator(search_results::MATCH_INDICATOR);
+        for range in rendered.emphasis {
+            self.results
+                .editor
+                .indicator(search_results::MATCH_INDICATOR, range)?;
+        }
+        self.results.links = rendered.links;
+        self.results.current = None;
+        let stale = results.files.iter().any(|file| {
+            file.source.is_none()
+                && !self
+                    .documents
+                    .iter()
+                    .any(|doc| doc.snapshot.id == file.id && doc.revision == file.revision)
+        });
+        let summary = results.summary()
+            + if stale {
+                " - some documents changed; rerun to navigate those matches."
+            } else {
+                " - double-click or Enter to navigate."
+            };
+        self.results.data = Some(results);
+        self.result_message(&summary);
+        self.update_result_buttons();
+        Ok(())
+    }
+    fn clear_find_results(&mut self) -> Result<()> {
+        if let Some(job) = &mut self.results.job {
+            job.cancelled.store(true, Ordering::Relaxed);
+            job.discard = true;
+        }
+        self.results
+            .editor
+            .set_read_only_text("Search results cleared. Run Find All to search again.\n")?;
+        self.results
+            .editor
+            .clear_indicator(search_results::MATCH_INDICATOR);
+        self.results.data = None;
+        self.results.links.clear();
+        self.results.current = None;
+        self.result_message("Search results cleared.");
+        self.update_result_buttons();
+        Ok(())
+    }
+    fn activate_result(&mut self, index: usize) -> Result<()> {
+        let Some(link) = self.results.links.get(index) else {
+            return Ok(());
+        };
+        let Some(results) = &self.results.data else {
+            return Ok(());
+        };
+        let file = &results.files[link.file];
+        let range = file.hits[link.hit].range.clone();
+        let row = link.row;
+        let id = file.id;
+        let revision = file.revision;
+        let source = file
+            .source
+            .as_ref()
+            .map(|source| (source.path.clone(), source.hash, source.text_hash));
+        let document = if let Some((path, hash, text_hash)) = source {
+            let bytes = match session::read_bounded(&path, core::MAX_DOCUMENT_BYTES) {
+                Ok(bytes) if session::fingerprint(&bytes) == hash => bytes,
+                _ => {
+                    self.result_message("This file changed or is unavailable since the search. Run Find in files again.");
+                    return Ok(());
+                }
+            };
+            let document = if let Some(index) = self
+                .documents
+                .iter()
+                .position(|doc| doc.snapshot.path.as_ref() == Some(&path))
+            {
+                index
+            } else {
+                let (_, encoding) = core::decode(&bytes, None)?;
+                self.clear_compare();
+                self.open_path(&path, Some(&encoding))?;
+                self.index()
+            };
+            self.scratch.attach(&self.documents[document].handle);
+            if session::fingerprint(self.scratch.text()?.as_bytes()) != text_hash {
+                self.result_message("This document changed since the search (including unsaved edits). Run Find in files again.");
+                return Ok(());
+            }
+            document
+        } else {
+            let Some(document) = self.documents.iter().position(|doc| doc.snapshot.id == id) else {
+                self.result_message("This result's document was closed. Run Find All again.");
+                return Ok(());
+            };
+            if self.documents[document].revision != revision {
+                self.result_message("This document changed since the search. Run Find All again before navigating its results.");
+                return Ok(());
+            }
+            document
+        };
+        if self.comparing && document != self.index() {
+            self.clear_compare();
+        }
+        if document != self.index() {
+            self.switch(document)?;
+        }
+        self.editor().select(range);
+        self.editor().focus();
+        self.results.current = Some(index);
+        let editor = &self.results.editor;
+        editor.send(SCI_ENSUREVISIBLEENFORCEPOLICY, row, 0);
+        let start = editor.send(SCI_POSITIONFROMLINE, row, 0).max(0) as usize;
+        let end = editor
+            .send(SCI_GETLINEENDPOSITION, row, 0)
+            .max(start as isize) as usize;
+        editor.select(start..end);
+        self.set_results_visible(true);
+        self.result_message(&format!(
+            "Search result {} of {} (F4 / Shift+F4)",
+            index + 1,
+            self.results.links.len()
+        ));
+        Ok(())
+    }
+    fn activate_result_position(&mut self, position: usize) -> Result<()> {
+        let editor = &self.results.editor;
+        let row = editor.send(SCI_LINEFROMPOSITION, position.min(editor.length()), 0) as usize;
+        if let Some(index) = self.results.links.iter().position(|link| link.row == row) {
+            self.activate_result(index)?;
+        } else {
+            editor.send(SCI_TOGGLEFOLD, row, 0);
+        }
+        Ok(())
+    }
+    fn next_result(&mut self, previous: bool) -> Result<()> {
+        let count = self.results.links.len();
+        if count == 0 {
+            self.set_results_visible(true);
+            self.note("No search matches are listed. Run Find All first.");
+            return Ok(());
+        }
+        let index = match (self.results.current, previous) {
+            (None, false) => 0,
+            (None, true) => count - 1,
+            (Some(index), false) => (index + 1) % count,
+            (Some(index), true) => (index + count - 1) % count,
+        };
+        let valid = (0..count)
+            .map(|step| {
+                if previous {
+                    (index + count - step) % count
+                } else {
+                    (index + step) % count
+                }
+            })
+            .find(|candidate| {
+                let Some(results) = &self.results.data else {
+                    return false;
+                };
+                let file = &results.files[self.results.links[*candidate].file];
+                file.source.is_some()
+                    || self
+                        .documents
+                        .iter()
+                        .any(|doc| doc.snapshot.id == file.id && doc.revision == file.revision)
+            });
+        self.activate_result(valid.unwrap_or(index))
+    }
+    fn poll_find_results(&mut self) -> Result<()> {
+        let Some(job) = &self.results.job else {
+            return Ok(());
+        };
+        let result = match job.rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Some(Err("Find All worker stopped unexpectedly.".into()))
+            }
+        };
+        let Some(result) = result else {
+            return Ok(());
+        };
+        let job = self.results.job.take().expect("active search task");
+        let cancelled = job.cancelled.load(Ordering::Relaxed);
+        let applied = (|| -> Result<()> {
+            if !job.discard {
+                match result {
+                    Ok(results) if !cancelled => self.apply_find_results(results)?,
+                    Ok(_) => {
+                        self.results
+                            .editor
+                            .set_read_only_text("Search cancelled.\n")?;
+                        self.result_message("Search cancelled.");
+                    }
+                    Err(error) => {
+                        self.results
+                            .editor
+                            .set_read_only_text(&format!("Find All: {error}\n"))?;
+                        self.result_message(&error);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        self.update_result_buttons();
+        applied
+    }
+
+    fn clear_compare_alignment(&mut self) {
+        self.compare_aligned = false;
+        self.compare_leading = [0; 2];
+        self.compare_top = [0; 2];
+        for (pane, editor) in self.editors.iter().enumerate() {
+            editor.widget().set_margin_top(0);
+            self.compare_native_row[pane] =
+                editor.send(SCI_GETFIRSTVISIBLELINE, 0, 0).max(0) as usize;
+        }
+    }
+
+    fn current_compare_row(&self) -> usize {
+        let visible = self.editor().send(SCI_GETFIRSTVISIBLELINE, 0, 0).max(0) as usize;
+        if self.compare_aligned {
+            visible
+                .saturating_add(self.compare_leading[self.focused])
+                .saturating_sub(self.compare_top[self.focused])
+        } else {
+            self.compare_row.saturating_add_signed(
+                visible as isize - self.compare_native_row[self.focused] as isize,
+            )
+        }
+    }
+
+    fn clear_compare_marks(&mut self) {
+        let row = if self.compare_jump {
+            0
+        } else {
+            self.current_compare_row()
+        };
+        for editor in &self.editors {
+            editor.clear_diff();
+        }
+        self.clear_compare_alignment();
+        self.compare_row = row;
+    }
+
+    fn align_compare_row(&mut self, row: usize) {
+        self.compare_row = row;
+        for (pane, editor) in self.editors.iter().enumerate() {
+            let gap = self.compare_leading[pane].saturating_sub(row);
+            self.compare_top[pane] = gap;
+            let margin = gap
+                .saturating_mul(editor.send(SCI_TEXTHEIGHT, 0, 0).max(1) as usize)
+                .min(
+                    self.pane_frames[pane]
+                        .allocated_height()
+                        .saturating_sub(1)
+                        .max(0) as usize,
+                ) as i32;
+            if editor.widget().margin_top() != margin {
+                editor.widget().set_margin_top(margin);
+            }
+            let first = row.saturating_sub(self.compare_leading[pane]);
+            if editor.send(SCI_GETFIRSTVISIBLELINE, 0, 0) != first as isize {
+                editor.send(SCI_SETFIRSTVISIBLELINE, first, 0);
+            }
+            self.compare_native_row[pane] =
+                editor.send(SCI_GETFIRSTVISIBLELINE, 0, 0).max(0) as usize;
+        }
+    }
+
     fn clear_compare(&mut self) {
         for doc in &self.documents {
             self.scratch.attach(&doc.handle);
             self.scratch.clear_diff();
         }
+        for editor in &self.editors {
+            editor.clear_diff();
+            editor.send(SCI_SETWRAPMODE, self.wrap as usize, 0);
+        }
         self.differences.clear();
+        self.clear_compare_alignment();
+        self.compare_row = 0;
         self.comparing = false;
+        self.compare_generation += 1;
+        self.compare_pair = None;
+        self.compare_selection = None;
         self.compare_rx = None;
         self.compare_due = None;
         self.compare_jump = false;
@@ -1582,19 +2785,186 @@ impl App {
         if self.documents.len() < 2 {
             return Err("Open two documents in separate tabs to compare.".into());
         }
+        let left = self.index();
+        self.begin_compare(left, (left + 1) % self.documents.len(), None)
+    }
+
+    fn begin_compare(
+        &mut self,
+        left: usize,
+        right: usize,
+        selection: Option<[std::ops::Range<usize>; 2]>,
+    ) -> Result<()> {
+        if left == right || left >= self.documents.len() || right >= self.documents.len() {
+            return Err("Choose two different documents to compare.".into());
+        }
+        self.compare_options.validate()?;
         self.clear_compare();
-        self.primary = self.index();
+        self.primary = left;
         self.focused = 0;
-        self.secondary = Some((self.primary + 1) % self.documents.len());
+        self.secondary = Some(right);
+        self.compare_pair = Some([
+            self.documents[left].snapshot.id,
+            self.documents[right].snapshot.id,
+        ]);
+        self.compare_selection = selection;
+        self.comparing = true;
         self.refresh_views()?;
         self.update_tabs();
-        self.comparing = true;
         self.compare_jump = true;
         self.launch_compare()
     }
 
+    fn selected_lines(editor: &Editor) -> Result<std::ops::Range<usize>> {
+        let range = editor.selection();
+        if range.is_empty() {
+            return Err("Select text in each of the two editing panes first. Selections expand to complete lines.".into());
+        }
+        let first = editor.send(SCI_LINEFROMPOSITION, range.start, 0).max(0) as usize;
+        let last_position = editor.send(SCI_POSITIONBEFORE, range.end, 0).max(0) as usize;
+        let last = editor.send(SCI_LINEFROMPOSITION, last_position, 0).max(0) as usize;
+        Ok(first..last + 1)
+    }
+
+    fn compare_selected_lines(&mut self) -> Result<()> {
+        let right = self
+            .secondary
+            .ok_or("Open the split view and select lines in two different documents first.")?;
+        let selection = [
+            Self::selected_lines(&self.editors[0])?,
+            Self::selected_lines(&self.editors[1])?,
+        ];
+        self.begin_compare(self.primary, right, Some(selection))
+    }
+
+    fn compare_snapshot(&mut self, clipboard: bool) -> Result<()> {
+        let left = self.index();
+        let doc = &self.documents[left].snapshot;
+        let (text, title) = if clipboard {
+            let clipboard = gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD);
+            let text = clipboard
+                .wait_for_text()
+                .ok_or("The clipboard does not contain text.")?;
+            (text.to_string(), "Clipboard snapshot".to_owned())
+        } else {
+            let path = doc.path.as_ref().ok_or(
+                "Save this document to a file before comparing with its last-saved content.",
+            )?;
+            let bytes = session::read_bounded(path, core::MAX_DOCUMENT_BYTES)?;
+            let encoding = (!self.documents[left].metadata_dirty
+                && doc.disk_hash == Some(session::fingerprint(&bytes)))
+            .then_some(&doc.encoding);
+            let (text, _) = core::decode(&bytes, encoding)?;
+            (text, format!("{} (last saved)", doc.title))
+        };
+        if text.len() > core::MAX_TOOL_BYTES {
+            return Err("Comparison snapshots are limited to 16 MiB.".into());
+        }
+        let language = doc.language.clone();
+        let left_id = doc.id;
+        self.clear_compare();
+        self.focused = 0;
+        self.add_document(DocumentSnapshot {
+            id: 0,
+            title,
+            path: None,
+            eol: Eol::detect(&text),
+            text,
+            encoding: Encoding::Utf8,
+            language,
+            dirty: true,
+            pinned: false,
+            disk_hash: None,
+            caret: 0,
+        })?;
+        let right = self.index();
+        let left = self
+            .documents
+            .iter()
+            .position(|doc| doc.snapshot.id == left_id)
+            .unwrap();
+        self.begin_compare(left, right, None)
+    }
+
+    fn choose_compare_options(&mut self) -> Result<()> {
+        let dialog = gtk::Dialog::with_buttons(
+            Some("Compare options"),
+            Some(&self.window),
+            gtk::DialogFlags::MODAL,
+            &[
+                ("_Cancel", gtk::ResponseType::Cancel),
+                ("_Apply", gtk::ResponseType::Ok),
+            ],
+        );
+        let content = dialog.content_area();
+        content.set_spacing(8);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
+        content.set_margin_top(12);
+        content.set_margin_bottom(12);
+        let mut checks = Vec::new();
+        for (label, value) in [
+            ("Ignore whitespace", self.compare_options.ignore_whitespace),
+            ("Ignore case", self.compare_options.ignore_case),
+            (
+                "Ignore empty lines",
+                self.compare_options.ignore_empty_lines,
+            ),
+            ("Detect moved lines", self.compare_options.detect_moves),
+            (
+                "Align corresponding lines (temporarily disable wrapping)",
+                self.compare_options.align,
+            ),
+        ] {
+            let check = gtk::CheckButton::with_label(label);
+            check.set_active(value);
+            content.pack_start(&check, false, false, 0);
+            checks.push(check);
+        }
+        let label = gtk::Label::new(Some("Ignore regex matches (empty disables):"));
+        label.set_xalign(0.0);
+        content.pack_start(&label, false, false, 0);
+        let regex = gtk::Entry::new();
+        regex.set_text(&self.compare_options.ignore_regex);
+        regex.set_max_length(32768);
+        content.pack_start(&regex, false, false, 0);
+        dialog.show_all();
+        let accepted = dialog.run() == gtk::ResponseType::Ok;
+        let options = CompareOptions {
+            ignore_whitespace: checks[0].is_active(),
+            ignore_case: checks[1].is_active(),
+            ignore_empty_lines: checks[2].is_active(),
+            detect_moves: checks[3].is_active(),
+            align: checks[4].is_active(),
+            ignore_regex: regex.text().to_string(),
+        };
+        dialog.close();
+        if accepted {
+            self.set_compare_options(options)?;
+        }
+        Ok(())
+    }
+
+    fn set_compare_options(&mut self, options: CompareOptions) -> Result<()> {
+        options.validate()?;
+        self.compare_options = options;
+        self.compare_generation += 1;
+        self.compare_rx = None;
+        if self.comparing {
+            self.clear_compare_marks();
+            self.differences.clear();
+            self.compare_due = Some(Instant::now());
+        }
+        for editor in &self.editors {
+            editor.send(SCI_SETWRAPMODE, self.effective_wrap() as usize, 0);
+        }
+        self.touch();
+        self.note("Comparison options updated.");
+        Ok(())
+    }
+
     fn launch_compare(&mut self) -> Result<()> {
-        if self.compare_rx.is_some() {
+        if self.compare_rx.is_some() || !self.comparing {
             return Ok(());
         }
         let Some(right_index) = self.secondary else {
@@ -1608,16 +2978,47 @@ impl App {
             left.revision,
             right.revision,
         );
-        let left_text = self.tool_text(&self.editors[0])?;
-        let right_text = self.tool_text(&self.editors[1])?;
+        let mut offsets = [(0, 0); 2];
+        let mut texts = Vec::new();
+        for (pane, editor) in self.editors.iter().enumerate() {
+            let text = if let Some(selection) = &self.compare_selection {
+                let lines = &selection[pane];
+                let line_count = editor.send(SCI_GETLINECOUNT, 0, 0).max(1) as usize;
+                let first = lines.start.min(line_count - 1);
+                let start = editor.send(SCI_POSITIONFROMLINE, first, 0).max(0) as usize;
+                let end = editor.send(SCI_POSITIONFROMLINE, lines.end.min(line_count), 0);
+                let end = if end < 0 {
+                    editor.length()
+                } else {
+                    end as usize
+                };
+                if end.saturating_sub(start) > core::MAX_TOOL_BYTES {
+                    return Err("Selected comparison lines exceed 16 MiB.".into());
+                }
+                offsets[pane] = (start, first);
+                editor.range(start..end.max(start))?
+            } else {
+                self.tool_text(editor)?
+            };
+            texts.push(text);
+        }
+        let options = self.compare_options.clone();
+        let generation = self.compare_generation;
+        let options_key = format!("{options:?}");
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
+            let result = comparison::compare(&texts[0], &texts[1], &options).map(|mut result| {
+                result.offset(offsets[0].0, offsets[0].1, offsets[1].0, offsets[1].1);
+                result
+            });
             let _ = tx.send(CompareResult {
                 left: left_id,
                 right: right_id,
                 left_rev,
                 right_rev,
-                result: core::compare(&left_text, &right_text),
+                generation,
+                options: options_key,
+                result,
             });
         });
         self.compare_rx = Some(rx);
@@ -1627,6 +3028,9 @@ impl App {
     }
 
     fn apply_compare(&mut self, result: CompareResult) -> Result<()> {
+        if !self.comparing || result.generation != self.compare_generation {
+            return Ok(());
+        }
         let Some(right) = self.secondary else {
             return Ok(());
         };
@@ -1635,16 +3039,17 @@ impl App {
             || self.documents[right].snapshot.id != result.right
             || self.documents[left].revision != result.left_rev
             || self.documents[right].revision != result.right_rev
+            || self.compare_pair != Some([result.left, result.right])
+            || result.options != format!("{:?}", self.compare_options)
         {
             if self.comparing {
                 self.compare_due = Some(Instant::now() + Duration::from_millis(300));
             }
             return Ok(());
         }
-        for editor in &self.editors {
-            editor.clear_diff();
-        }
-        self.differences = result.result?;
+        self.clear_compare_marks();
+        let comparison = result.result?;
+        self.differences = comparison.differences;
         for diff in &self.differences {
             for line in diff.left.clone() {
                 self.editors[0].send(SCI_MARKERADD, line, 20);
@@ -1659,9 +3064,48 @@ impl App {
                 self.editors[1].indicator(21, range.clone())?;
             }
         }
+        for moved in &comparison.moves {
+            self.editors[0].send(SCI_MARKERADD, moved.left, 22);
+            self.editors[1].send(SCI_MARKERADD, moved.right, 22);
+        }
+        if self.compare_options.align {
+            let zoom = self.editor().send(SCI_GETZOOM, 0, 0);
+            for editor in &self.editors {
+                editor.send(SCI_SETZOOM, zoom as usize, 0);
+            }
+            self.compare_leading = [
+                self.editors[0].apply_compare_padding(&comparison.left_padding)?,
+                self.editors[1].apply_compare_padding(&comparison.right_padding)?,
+            ];
+            self.compare_aligned = true;
+            self.align_compare_row(self.compare_row);
+        }
+        let ignored: Vec<_> = [
+            (self.compare_options.ignore_whitespace, "whitespace"),
+            (self.compare_options.ignore_case, "case"),
+            (self.compare_options.ignore_empty_lines, "empty lines"),
+            (
+                !self.compare_options.ignore_regex.is_empty(),
+                "regex matches",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(enabled, label)| enabled.then_some(label))
+        .collect();
         self.note(format!(
-            "{} difference groups. Red: left; green: right. F7 to navigate.",
-            self.differences.len()
+            "{} difference groups, {} moved lines. Red: left; green: right; purple: moved. {}{}F7 to navigate.",
+            self.differences.len(),
+            comparison.moves.len(),
+            if self.compare_selection.is_some() {
+                "Selected lines only. "
+            } else {
+                ""
+            },
+            if ignored.is_empty() {
+                String::new()
+            } else {
+                format!("Ignoring {}. ", ignored.join(", "))
+            },
         ));
         if self.compare_jump && !self.differences.is_empty() {
             self.difference = self.differences.len() - 1;
@@ -1681,14 +3125,23 @@ impl App {
         let count = self.differences.len();
         self.difference = (self.difference + if previous { count - 1 } else { 1 }) % count;
         let diff = &self.differences[self.difference];
-        for (editor, line) in [
+        let mut aligned_row = usize::MAX;
+        for (pane, (editor, line)) in [
             (&self.editors[0], diff.left.start),
             (&self.editors[1], diff.right.start),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let line = line.min(editor.send(SCI_GETLINECOUNT, 0, 0).saturating_sub(1) as usize);
             editor.send(SCI_GOTOLINE, line, 0);
             editor.send(SCI_ENSUREVISIBLEENFORCEPOLICY, line, 0);
-            editor.send(SCI_SETFIRSTVISIBLELINE, line.saturating_sub(4), 0);
+            let visible = editor.send(SCI_VISIBLEFROMDOCLINE, line, 0).max(0) as usize;
+            aligned_row = aligned_row.min(visible + self.compare_leading[pane]);
+            editor.send(SCI_SETFIRSTVISIBLELINE, visible.saturating_sub(4), 0);
+        }
+        if self.compare_aligned {
+            self.align_compare_row(aligned_row.saturating_sub(4));
         }
         self.note(format!("Difference {} of {count}", self.difference + 1));
     }
@@ -1934,7 +3387,49 @@ impl App {
     }
 
     fn command(&mut self, command: usize) -> Result<()> {
-        let editor = self.editor();
+        let result_focus = self.results.has_focus();
+        if result_focus
+            && matches!(
+                command,
+                UNDO | REDO
+                    | CUT
+                    | PASTE
+                    | DUPLICATE
+                    | DELETE_LINE
+                    | UPPER
+                    | LOWER
+                    | TITLE_CASE
+                    | SENTENCE_CASE
+                    | INVERT_CASE
+                    | SORT
+                    | SORT_DESC
+                    | UNIQUE
+                    | TRIM
+                    | REMOVE_EMPTY
+                    | SORT_IGNORE_CASE
+                    | SORT_DESC_IGNORE_CASE
+                    | SORT_NATURAL
+                    | SORT_NUMERIC
+                    | SORT_NUMERIC_DESC
+                    | SORT_NUMERIC_COMMA
+                    | REVERSE_LINES
+                    | UNIQUE_ADJACENT
+                    | TRIM_START
+                    | TRIM_BOTH
+                    | REMOVE_EMPTY_ONLY
+                    | JOIN_LINES
+                    | ADD_NEXT
+                    | SELECT_MATCHES
+            )
+        {
+            self.note("Search results are read-only. Focus an editing pane to modify a document.");
+            return Ok(());
+        }
+        let editor = if result_focus && matches!(command, COPY | SELECT_ALL) {
+            self.results.editor.clone()
+        } else {
+            self.editor()
+        };
         match command {
             NEW => self.new_document()?,
             OPEN => {
@@ -2034,12 +3529,60 @@ impl App {
                 editor.send(SCI_MULTIPLESELECTADDEACH, 0, 0);
             }
             FIND => self.show_search()?,
+            FIND_FILES => {
+                self.search.folder_visible = true;
+                if self.search.directory.text().is_empty() {
+                    let directory = self.documents[self.index()]
+                        .snapshot
+                        .path
+                        .as_ref()
+                        .and_then(|path| path.parent().map(Path::to_path_buf))
+                        .or_else(|| std::env::current_dir().ok());
+                    if let Some(directory) = directory {
+                        self.search.directory.set_text(&directory.to_string_lossy());
+                    }
+                }
+                self.show_search()?;
+            }
+            FIND_FILES_RUN => self.start_find_files()?,
+            FIND_FOLDER => self.choose_search_folder(),
+            TAB_PIN => self.pin_tab(self.documents[self.index()].snapshot.id),
+            TAB_LEFT | TAB_RIGHT => {
+                self.event(Event::StepTab(
+                    self.documents[self.index()].snapshot.id,
+                    command == TAB_LEFT,
+                ))?;
+            }
             SEARCH_CLOSE => {
                 self.search.visible = false;
                 self.layout();
                 editor.focus();
             }
             FIND_NEXT | FIND_PREVIOUS => self.find(command == FIND_PREVIOUS)?,
+            FIND_ALL_CURRENT => self.start_find_all(false)?,
+            FIND_ALL_OPEN => self.start_find_all(true)?,
+            RESULTS_TOGGLE => {
+                self.set_results_visible(!self.results.visible);
+                if self.results.visible {
+                    self.results.editor.focus();
+                } else {
+                    self.editor().focus();
+                }
+            }
+            RESULTS_NEXT => self.next_result(false)?,
+            RESULTS_PREVIOUS => self.next_result(true)?,
+            RESULTS_ACTIVATE => self.activate_result_position(self.results.editor.position())?,
+            RESULTS_CLEAR => self.clear_find_results()?,
+            RESULTS_CLOSE => {
+                self.set_results_visible(false);
+                self.editor().focus();
+            }
+            RESULTS_CANCEL => {
+                if let Some(job) = &self.results.job {
+                    job.cancelled.store(true, Ordering::Relaxed);
+                    self.result_message("Cancelling search...");
+                }
+            }
             REPLACE | REPLACE_ALL => self.replace(command == REPLACE_ALL)?,
             SPLIT => {
                 self.clear_compare();
@@ -2063,8 +3606,45 @@ impl App {
             WRAP => {
                 self.wrap = !self.wrap;
                 for editor in &self.editors {
-                    editor.send(SCI_SETWRAPMODE, self.wrap as usize, 0);
+                    editor.send(SCI_SETWRAPMODE, self.effective_wrap() as usize, 0);
                 }
+            }
+            MONITOR_FILES => {
+                self.monitor_files = !self.monitor_files;
+                if self.monitor_files {
+                    self.monitor.reset();
+                }
+                self.last_monitor = Instant::now() - Duration::from_secs(1);
+                if let Some(item) = &self.monitor_item {
+                    SYMBOLS_UPDATING.with(|flag| flag.set(true));
+                    item.set_active(self.monitor_files);
+                    SYMBOLS_UPDATING.with(|flag| flag.set(false));
+                }
+                self.touch();
+                self.note(if self.monitor_files {
+                    "External file monitoring enabled."
+                } else {
+                    "External file monitoring disabled."
+                });
+            }
+            SYMBOL_SPACE | SYMBOL_EOL | SYMBOL_NONPRINTING | SYMBOL_CONTROLS | SYMBOL_ALL
+            | SYMBOL_INDENT | SYMBOL_WRAP => {
+                match command {
+                    SYMBOL_SPACE => self.show_symbols.whitespace = !self.show_symbols.whitespace,
+                    SYMBOL_EOL => self.show_symbols.eol = !self.show_symbols.eol,
+                    SYMBOL_NONPRINTING => {
+                        self.show_symbols.non_printing = !self.show_symbols.non_printing
+                    }
+                    SYMBOL_CONTROLS => self.show_symbols.controls = !self.show_symbols.controls,
+                    SYMBOL_ALL => self.show_symbols.toggle_all(),
+                    SYMBOL_INDENT => {
+                        self.show_symbols.indent_guides = !self.show_symbols.indent_guides
+                    }
+                    SYMBOL_WRAP => self.show_symbols.wrap_markers = !self.show_symbols.wrap_markers,
+                    _ => unreachable!(),
+                }
+                self.apply_symbols();
+                self.touch();
             }
             ZOOM_RESET => {
                 for editor in &self.editors {
@@ -2088,6 +3668,10 @@ impl App {
                 self.touch();
             }
             COMPARE => self.start_compare()?,
+            COMPARE_SELECTION => self.compare_selected_lines()?,
+            COMPARE_CLIPBOARD => self.compare_snapshot(true)?,
+            COMPARE_SAVED => self.compare_snapshot(false)?,
+            COMPARE_SETTINGS => self.choose_compare_options()?,
             COMPARE_CLEAR => {
                 self.clear_compare();
                 self.note("Compare cleared.");
@@ -2176,6 +3760,7 @@ impl App {
                     doc.metadata_dirty = false;
                     doc.revision += 1;
                     doc.styled_revision = None;
+                    self.invalidate_tools(self.documents[index].snapshot.id);
                     self.touch();
                     self.refresh_views()?;
                     self.update_tabs();
@@ -2198,6 +3783,8 @@ impl App {
     }
 
     fn tick(&mut self) -> Result<()> {
+        self.poll_monitor();
+        self.poll_find_results()?;
         while let Ok((revision, result)) = self.recovery.rx.try_recv() {
             self.recovery_busy = false;
             match result {
@@ -2328,6 +3915,9 @@ impl App {
                 return Ok(());
             }
         }
+        if let Some(job) = &self.results.job {
+            job.cancelled.store(true, Ordering::Relaxed);
+        }
         self.exiting = true;
         self.window.hide();
         unsafe {
@@ -2347,6 +3937,18 @@ impl App {
             Event::Theme => {
                 if self.theme == "system" {
                     self.apply_theme();
+                }
+            }
+            Event::MoveTab(id, requested) => self.move_tab(id, requested)?,
+            Event::PinTab(id) => self.pin_tab(id),
+            Event::StepTab(id, previous) => {
+                if let Some(index) = self.documents.iter().position(|doc| doc.snapshot.id == id) {
+                    let requested = if previous {
+                        index.saturating_sub(1)
+                    } else {
+                        (index + 1).min(self.documents.len() - 1)
+                    };
+                    self.move_tab(id, requested)?;
                 }
             }
             Event::Tab(id) | Event::CloseTab(id) => {
@@ -2384,6 +3986,10 @@ impl App {
                 }
             }
             Event::Escape => {
+                if self.results.has_focus() {
+                    self.command(RESULTS_CLOSE)?;
+                    return Ok(());
+                }
                 self.editor().send(SCI_AUTOCCANCEL, 0, 0);
                 self.editor().send(SCI_CALLTIPCANCEL, 0, 0);
                 if self.search.visible {
@@ -2407,6 +4013,26 @@ impl App {
             Event::Updated(pane, id) => {
                 if self.pane_ids[pane].get() == id {
                     self.editors[pane].update_line_number_margin();
+                    if self.compare_aligned {
+                        let editor = &self.editors[pane];
+                        let visible = editor.send(SCI_GETFIRSTVISIBLELINE, 0, 0);
+                        let expected = self.compare_row.saturating_sub(self.compare_leading[pane]);
+                        let zoom = editor.send(SCI_GETZOOM, 0, 0);
+                        if self.editors[1 - pane].send(SCI_GETZOOM, 0, 0) != zoom {
+                            self.editors[1 - pane].send(SCI_SETZOOM, zoom as usize, 0);
+                            for frame in &self.pane_frames {
+                                frame.queue_resize();
+                            }
+                        }
+                        let row = if visible == expected as isize {
+                            self.compare_row
+                        } else if visible <= 0 {
+                            0
+                        } else {
+                            visible as usize + self.compare_leading[pane]
+                        };
+                        self.align_compare_row(row);
+                    }
                 }
                 if pane == self.focused && self.pane_ids[pane].get() == id {
                     let index = self.index();
@@ -2425,14 +4051,20 @@ impl App {
                     self.update_map_view();
                     if self.comparing && self.secondary.is_some() {
                         let visible = editor.send(SCI_GETFIRSTVISIBLELINE, 0, 0);
-                        let source = editor
-                            .send(SCI_DOCLINEFROMVISIBLE, visible as usize, 0)
-                            .max(0) as usize;
-                        let target = core::corresponding_line(&self.differences, source, pane == 1);
-                        let other = &self.editors[1 - pane];
-                        let line = other.send(SCI_VISIBLEFROMDOCLINE, target, 0).max(0);
-                        if other.send(SCI_GETFIRSTVISIBLELINE, 0, 0) != line {
-                            other.send(SCI_SETFIRSTVISIBLELINE, line as usize, 0);
+                        if !self.compare_options.align {
+                            let other = &self.editors[1 - pane];
+                            let source = editor
+                                .send(SCI_DOCLINEFROMVISIBLE, visible.max(0) as usize, 0)
+                                .max(0) as usize;
+                            let target =
+                                core::corresponding_line(&self.differences, source, pane == 1);
+                            let line = other.send(SCI_VISIBLEFROMDOCLINE, target, 0).max(0);
+                            if other.send(SCI_GETFIRSTVISIBLELINE, 0, 0) != line {
+                                other.send(SCI_SETFIRSTVISIBLELINE, line as usize, 0);
+                            }
+                        } else if !self.compare_aligned && !self.compare_jump {
+                            self.compare_row = self.current_compare_row();
+                            self.compare_native_row[pane] = visible.max(0) as usize;
                         }
                     }
                     self.update_status();
@@ -2457,20 +4089,7 @@ impl App {
                     doc.snapshot.dirty = dirty;
                     doc.revision += 1;
                     doc.last_edit = Instant::now();
-                    if self.json_document == Some(id) {
-                        self.json_document = None;
-                    }
-                    if self.tree_visible && index == self.index() {
-                        self.schedule_json();
-                    }
-                    if self.comparing {
-                        for editor in &self.editors {
-                            editor.clear_diff();
-                        }
-                        self.differences.clear();
-                        self.compare_due = Some(Instant::now() + Duration::from_millis(350));
-                        self.note = "Updating comparison...".into();
-                    }
+                    self.invalidate_tools(id);
                     self.touch();
                     if changed {
                         self.update_tabs();
@@ -2566,6 +4185,12 @@ impl App {
             Event::MapScroll(delta) => {
                 self.map.send(SCI_LINESCROLL, 0, delta);
             }
+            Event::CompareScroll(pane, id, delta) => {
+                if self.compare_aligned && self.pane_ids[pane].get() == id {
+                    self.align_compare_row(self.compare_row.saturating_add_signed(delta));
+                }
+            }
+            Event::ResultActivate(position) => self.activate_result_position(position)?,
         }
         Ok(())
     }
@@ -2596,6 +4221,9 @@ fn keyboard(event: &gdk::EventKey) -> glib::Propagation {
         (true, true, false, key::s) => Some(SAVE_AS),
         (true, false, false, key::w) => Some(CLOSE),
         (true, false, false, key::f | key::h) => Some(FIND),
+        (true, true, false, key::f) => Some(FIND_FILES),
+        (true, true, false, key::Page_Up) => Some(TAB_LEFT),
+        (true, true, false, key::Page_Down) => Some(TAB_RIGHT),
         (true, false, false, key::d) => Some(ADD_NEXT),
         (true, true, false, key::l) => Some(SELECT_MATCHES),
         (true, true, false, key::u) => Some(UPPER),
@@ -2605,6 +4233,11 @@ fn keyboard(event: &gdk::EventKey) -> glib::Propagation {
         (true, false, true, key::Right) => Some(SPLIT),
         (false, false, false, key::F3) => Some(FIND_NEXT),
         (false, true, false, key::F3) => Some(FIND_PREVIOUS),
+        (false, false, false, key::F4) => Some(RESULTS_NEXT),
+        (false, true, false, key::F4) => Some(RESULTS_PREVIOUS),
+        (true, false, true, key::Return | key::KP_Enter) => Some(FIND_ALL_CURRENT),
+        (true, true, false, key::Return | key::KP_Enter) => Some(FIND_ALL_OPEN),
+        (true, false, true, key::r) => Some(RESULTS_TOGGLE),
         (false, false, false, key::F7) => Some(DIFF_NEXT),
         (false, true, false, key::F7) => Some(DIFF_PREVIOUS),
         (true, false, false, key::space) => Some(COMPLETE),

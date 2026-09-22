@@ -17,7 +17,7 @@ impl Rng {
         let count = self.next() % max + 1;
         let mut text = String::new();
         for _ in 0..count {
-            text.push_str(self.pick(pieces));
+            text.push_str(self.pick::<&str>(pieces));
         }
         text
     }

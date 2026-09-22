@@ -1,11 +1,17 @@
+pub mod comparison;
 pub mod completion;
 pub mod core;
 pub mod editor;
+pub mod folder_search;
 pub mod json_tools;
 pub mod languages;
 pub mod markdown;
+pub mod monitor;
+pub mod search_results;
 pub mod session;
+pub mod symbols;
 pub mod syntax;
+pub mod tabs;
 pub mod toolbar;
 pub mod udl;
 pub mod ui;

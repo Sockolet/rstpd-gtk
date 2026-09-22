@@ -40,6 +40,7 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Tests
+        timeout-minutes: 10
         run: xvfb-run -a cargo test --locked --tests
 
       # Parsers are platform-independent and need no display; release mode keeps
@@ -49,3 +50,28 @@ jobs:
 
       - name: Release build
         run: cargo build --locked --release
+
+      - name: Package manual build artifact
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          name="rstpd-gtk-${version}-linux-x86_64"
+          mkdir -p "dist/${name}/share/applications" "dist/${name}/licenses"
+          cp target/release/rstpd "dist/${name}/"
+          cp README.md LICENSE THIRD_PARTY_NOTICES.txt "dist/${name}/"
+          cp assets/io.github.Sockolet.rstpd-gtk.desktop "dist/${name}/share/applications/"
+          cp vendor/scintilla/License.txt "dist/${name}/licenses/Scintilla-Lexilla-SciTE.txt"
+          tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+
+      - name: Upload verified manual build
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rstpd-gtk-linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
