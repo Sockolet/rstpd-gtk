@@ -304,18 +304,18 @@ fn exercise_symbols_results_and_counts(app: &mut App) {
         app.window.resize(size.0, size.1);
         wait_for(app, |app| app.search.query.allocated_width() > 100);
         let controls: Vec<gtk::Widget> = vec![
-            app.search.query.clone().upcast(),
-            app.search.replace.clone().upcast(),
-            app.search.mode.clone().upcast(),
-            app.search.case.clone().upcast(),
-            app.search.word.clone().upcast(),
+            app.search.query.clone().upcast::<gtk::Widget>(),
+            app.search.replace.clone().upcast::<gtk::Widget>(),
+            app.search.mode.clone().upcast::<gtk::Widget>(),
+            app.search.case.clone().upcast::<gtk::Widget>(),
+            app.search.word.clone().upcast::<gtk::Widget>(),
         ]
         .into_iter()
         .chain(
             app.search
                 .buttons
                 .iter()
-                .map(|(_, button)| button.clone().upcast()),
+                .map(|(_, button)| button.clone().upcast::<gtk::Widget>()),
         )
         .filter(|control| control.is_drawable())
         .collect();
@@ -500,10 +500,16 @@ fn document_index(app: &App, id: u64) -> usize {
 }
 
 fn press(widget: &gtk::Widget, kind: gdk::EventType, button: u32) -> bool {
+    press_at(widget, kind, button, (0.0, 0.0))
+}
+
+fn press_at(widget: &gtk::Widget, kind: gdk::EventType, button: u32, position: (f64, f64)) -> bool {
     let mut event = gdk::Event::new(kind);
     let native: &mut gdk::ffi::GdkEventButton =
         event.downcast_mut::<gdk::EventButton>().unwrap().as_mut();
     native.button = button;
+    native.x = position.0;
+    native.y = position.1;
     let value: glib::Value = event.into();
     widget.emit_by_name("button-press-event", &[&value])
 }
@@ -550,17 +556,61 @@ fn exercise_tab_order(app: &mut App) {
     assert!(app.documents[edited_index].snapshot.dirty);
     assert!(app.snapshot().unwrap().documents[0].pinned);
 
-    let empty_strip = app.tabs.action_widget(gtk::PackType::End).unwrap();
+    let strip = app.tabs.parent().unwrap().downcast::<gtk::Box>().unwrap();
+    let empty_strip = strip.children()[1].clone();
     assert!(empty_strip.tooltip_text().unwrap().contains("Double-click"));
+    app.window.resize(1280, 840);
+    wait_for(app, |app| {
+        let last = app.tabs.nth_page(Some(app.tabs.n_pages() - 1)).unwrap();
+        app.tabs.allocated_width() == app.tab_width.get()
+            && app.tabs.tab_label(&last).unwrap().allocated_width() > 100
+            && app.tabs.tab_label(&last).unwrap().is_drawable()
+            && empty_strip.allocated_width() > 48
+    });
+    let (tab_x, _) = app.tabs.translate_coordinates(&strip, 0, 0).unwrap();
+    let (blank_x, blank_y) = empty_strip.translate_coordinates(&strip, 0, 0).unwrap();
+    assert_eq!(
+        blank_x,
+        tab_x + app.tabs.allocated_width(),
+        "The expandable blank strip must start immediately after the full native tab header"
+    );
+    let last = app.tabs.nth_page(Some(app.tabs.n_pages() - 1)).unwrap();
+    let last_label = app.tabs.tab_label(&last).unwrap();
+    let (last_x, _) = last_label.translate_coordinates(&strip, 0, 0).unwrap();
+    assert!(blank_x >= last_x + last_label.allocated_width());
+    let boundary = (blank_x + 1, blank_y + empty_strip.allocated_height() / 2);
+    let (x, y) = strip
+        .translate_coordinates(&empty_strip, boundary.0, boundary.1)
+        .unwrap();
+    assert_eq!(
+        x, 1,
+        "Exercise the first blank pixel after the tab boundary, not the far-right action area"
+    );
+    let position = (f64::from(x), f64::from(y));
     let count = app.documents.len();
-    assert!(!press(&empty_strip, gdk::EventType::ButtonPress, 1));
-    assert!(!press(&empty_strip, gdk::EventType::DoubleButtonPress, 3));
+    assert!(!press_at(
+        &empty_strip,
+        gdk::EventType::ButtonPress,
+        1,
+        position
+    ));
+    assert!(!press_at(
+        &empty_strip,
+        gdk::EventType::DoubleButtonPress,
+        3,
+        position
+    ));
     let page = app.tabs.nth_page(Some(0)).unwrap();
     let label = app.tabs.tab_label(&page).unwrap();
     press(&label, gdk::EventType::DoubleButtonPress, 1);
     pump(app);
     assert_eq!(app.documents.len(), count);
-    assert!(press(&empty_strip, gdk::EventType::DoubleButtonPress, 1));
+    assert!(press_at(
+        &empty_strip,
+        gdk::EventType::DoubleButtonPress,
+        1,
+        position
+    ));
     pump(app);
     assert_eq!(app.documents.len(), count + 1);
     assert!(!app.documents.last().unwrap().snapshot.pinned);
@@ -619,6 +669,34 @@ fn exercise_external_reload(app: &mut App, directory: &Path) {
         assert_eq!(editor.position(), caret);
         assert_eq!(editor.send(SCI_GETFIRSTVISIBLELINE, 0, 0), scroll);
     }
+    wait_for(app, |app| !app.monitor_busy);
+    let paused = format!("{updated}changed while monitoring was paused\n");
+    fs::write(&path, &paused).unwrap();
+    app.last_monitor = Instant::now() - Duration::from_secs(2);
+    app.poll_monitor();
+    assert!(app.monitor_busy);
+    app.command(MONITOR_FILES).unwrap();
+    assert!(!app.monitor_files && app.monitor_busy);
+    wait_for(app, |app| !app.monitor_busy);
+    assert_eq!(
+        app.editor().text().unwrap(),
+        updated,
+        "Disabled monitoring must discard the outstanding result"
+    );
+    assert_eq!(
+        app.documents[document_index(app, id)].snapshot.disk_hash,
+        Some(session::fingerprint(updated.as_bytes()))
+    );
+    app.command(MONITOR_FILES).unwrap();
+    wait_for(app, |app| {
+        app.documents[document_index(app, id)].snapshot.disk_hash
+            == Some(session::fingerprint(paused.as_bytes()))
+    });
+    assert_eq!(
+        app.editor().text().unwrap(),
+        paused,
+        "Re-enabling must rescan an unchanged external version whose earlier result was discarded"
+    );
     let baseline = app.documents[document_index(app, id)].snapshot.disk_hash;
     let revision = app.documents[document_index(app, id)].revision;
     app.editor().replace(0..0, "unsaved ").unwrap();
@@ -787,11 +865,9 @@ fn respond_to_compare_options(app: &mut App, options: CompareOptions, response: 
     let timer = glib::timeout_add_local(Duration::from_millis(10), move || {
         let dialog = gtk::Window::list_toplevels()
             .into_iter()
-            .find_map(|window| {
-                (window.title().as_deref() == Some("Compare options"))
-                    .then(|| window.downcast::<gtk::Dialog>().ok())
-                    .flatten()
-            });
+            .filter_map(|widget| widget.downcast::<gtk::Window>().ok())
+            .filter(|window| window.title().as_deref() == Some("Compare options"))
+            .find_map(|window| window.downcast::<gtk::Dialog>().ok());
         let Some(dialog) = dialog else {
             return glib::ControlFlow::Continue;
         };
@@ -1040,7 +1116,7 @@ fn exercise_compare_modes(app: &mut App, directory: &Path) {
         "Logical spacers must not be truncated with rendered pixels"
     );
     assert_eq!(app.current_compare_row(), 0);
-    assert!(app.editors[0].widget().margin_top() <= app.pane_frames[0].allocated_height() - 1);
+    assert!(app.editors[0].widget().margin_top() < app.pane_frames[0].allocated_height());
     assert!(app.editors[0].widget().allocated_height() > 0);
     assert_eq!(
         app.window.preferred_height().0,

@@ -6,7 +6,11 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant, SystemTime},
 };
@@ -144,6 +148,7 @@ impl Scanner {
 
 pub struct Monitor {
     tx: mpsc::SyncSender<Option<Vec<Request>>>,
+    reset: Arc<AtomicBool>,
     pub rx: mpsc::Receiver<Vec<Change>>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -156,9 +161,14 @@ impl Monitor {
     pub fn new() -> Self {
         let (tx, requests) = mpsc::sync_channel(1);
         let (results, rx) = mpsc::channel();
+        let reset = Arc::new(AtomicBool::new(false));
+        let reset_requested = reset.clone();
         let thread = thread::spawn(move || {
             let mut scanner = Scanner::default();
             while let Ok(Some(request)) = requests.recv() {
+                if reset_requested.swap(false, Ordering::AcqRel) {
+                    scanner = Scanner::default();
+                }
                 if results.send(scanner.scan(request)).is_err() {
                     break;
                 }
@@ -166,6 +176,7 @@ impl Monitor {
         });
         Self {
             tx,
+            reset,
             rx,
             thread: Some(thread),
         }
@@ -174,6 +185,9 @@ impl Monitor {
         self.tx
             .try_send(Some(requests))
             .map_err(|e| format!("File monitoring could not start: {e}"))
+    }
+    pub fn reset(&self) {
+        self.reset.store(true, Ordering::Release);
     }
 }
 impl Drop for Monitor {
@@ -240,6 +254,57 @@ mod tests {
         assert!(scanner.scan(request(Some(snapshot.hash))).is_empty());
         fs::write(&path, b"recreated").unwrap();
         assert_eq!(scanner.scan(request(Some(snapshot.hash))).len(), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn resuming_monitoring_rechecks_a_previously_discarded_change() {
+        let path = std::env::temp_dir().join(format!(
+            "rstpd-monitor-reset-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, b"external").unwrap();
+        let monitor = Monitor::new();
+        let request = || {
+            vec![Request {
+                id: 1,
+                path: path.clone(),
+                known_hash: Some(session::fingerprint(b"old")),
+                encoding: Encoding::Utf8,
+            }]
+        };
+        monitor.submit(request()).unwrap();
+        assert_eq!(
+            monitor
+                .rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .len(),
+            1
+        );
+        monitor.submit(request()).unwrap();
+        assert!(
+            monitor
+                .rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .is_empty()
+        );
+        monitor.reset();
+        monitor.submit(request()).unwrap();
+        assert_eq!(
+            monitor
+                .rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(monitor);
         fs::remove_file(path).unwrap();
     }
 }

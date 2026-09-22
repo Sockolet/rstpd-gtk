@@ -619,6 +619,7 @@ struct App {
     window: gtk::Window,
     menu: gtk::MenuBar,
     tabs: gtk::Notebook,
+    tab_width: Rc<Cell<i32>>,
     status: gtk::Label,
     search: SearchBar,
     content: gtk::Paned,
@@ -729,11 +730,12 @@ impl App {
         tabs.set_scrollable(true);
         tabs.set_show_border(false);
         tabs.set_can_focus(false);
+        tabs.set_hexpand(false);
         tabs.connect_switch_page(move |_, page, _| {
-            if !TABS_UPDATING.with(Cell::get) {
-                if let Ok(id) = page.widget_name().parse::<u64>() {
-                    queue(Event::Tab(id));
-                }
+            if !TABS_UPDATING.with(Cell::get)
+                && let Ok(id) = page.widget_name().parse::<u64>()
+            {
+                queue(Event::Tab(id));
             }
         });
         tabs.connect_page_reordered(|_, page, position| {
@@ -753,8 +755,30 @@ impl App {
         empty_strip.connect_button_press_event(|_, event| {
             empty_tab_strip_press(event.event_type(), event.button())
         });
-        tabs.set_action_widget(&empty_strip, gtk::PackType::End);
-        root.pack_start(&tabs, false, false, 0);
+        let tab_strip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        tab_strip.pack_start(&tabs, false, false, 0);
+        tab_strip.pack_start(&empty_strip, true, true, 0);
+        let tab_width = Rc::new(Cell::new(1));
+        let width = tab_width.clone();
+        let notebook = tabs.clone();
+        let blank = empty_strip.clone();
+        tab_strip.connect_size_allocate(move |_, allocation| {
+            // Scrollable notebooks request only one tab; retain full headers when they fit.
+            let width = width.get().min((allocation.width() - 48).max(1));
+            notebook.size_allocate(&gtk::Allocation::new(
+                allocation.x(),
+                allocation.y(),
+                width,
+                allocation.height(),
+            ));
+            blank.size_allocate(&gtk::Allocation::new(
+                allocation.x() + width,
+                allocation.y(),
+                (allocation.width() - width).max(1),
+                allocation.height(),
+            ));
+        });
+        root.pack_start(&tab_strip, false, false, 0);
         let search = SearchBar::new();
         root.pack_start(&search.container, false, false, 0);
         let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -928,6 +952,7 @@ impl App {
             window,
             menu,
             tabs,
+            tab_width,
             status,
             search,
             content,
@@ -1673,6 +1698,10 @@ impl App {
             page.show();
         }
         self.tabs.set_current_page(Some(self.index() as u32));
+        self.tabs.show();
+        self.tabs.set_scrollable(false);
+        self.tab_width.set(self.tabs.preferred_width().1.max(1));
+        self.tabs.set_scrollable(true);
         TABS_UPDATING.with(|flag| flag.set(false));
         if let Some(doc) = self.documents.get(self.index()) {
             self.window.set_title(&format!(
@@ -2050,25 +2079,22 @@ impl App {
             .editors
             .iter()
             .enumerate()
-            .filter_map(|(pane, editor)| {
-                (self.pane_ids[pane].get() == change.id).then(|| {
-                    (
-                        pane,
-                        (0..editor.send(SCI_GETSELECTIONS, 0, 0).max(1) as usize)
-                            .map(|selection| {
-                                (
-                                    editor.send(SCI_GETSELECTIONNANCHOR, selection, 0).max(0)
-                                        as usize,
-                                    editor.send(SCI_GETSELECTIONNCARET, selection, 0).max(0)
-                                        as usize,
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                        editor.send(SCI_GETMAINSELECTION, 0, 0).max(0) as usize,
-                        editor.send(SCI_GETFIRSTVISIBLELINE, 0, 0).max(0) as usize,
-                        editor.send(SCI_GETXOFFSET, 0, 0),
-                    )
-                })
+            .filter(|(pane, _)| self.pane_ids[*pane].get() == change.id)
+            .map(|(pane, editor)| {
+                (
+                    pane,
+                    (0..editor.send(SCI_GETSELECTIONS, 0, 0).max(1) as usize)
+                        .map(|selection| {
+                            (
+                                editor.send(SCI_GETSELECTIONNANCHOR, selection, 0).max(0) as usize,
+                                editor.send(SCI_GETSELECTIONNCARET, selection, 0).max(0) as usize,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    editor.send(SCI_GETMAINSELECTION, 0, 0).max(0) as usize,
+                    editor.send(SCI_GETFIRSTVISIBLELINE, 0, 0).max(0) as usize,
+                    editor.send(SCI_GETXOFFSET, 0, 0),
+                )
             })
             .collect();
         let boundary = |position: usize| {
@@ -3585,8 +3611,9 @@ impl App {
             }
             MONITOR_FILES => {
                 self.monitor_files = !self.monitor_files;
-                self.monitor = Monitor::new();
-                self.monitor_busy = false;
+                if self.monitor_files {
+                    self.monitor.reset();
+                }
                 self.last_monitor = Instant::now() - Duration::from_secs(1);
                 if let Some(item) = &self.monitor_item {
                     SYMBOLS_UPDATING.with(|flag| flag.set(true));

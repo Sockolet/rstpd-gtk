@@ -157,7 +157,7 @@ fn lines(
     }
     Ok((result, index + 1))
 }
-fn source_range(lines: &[Line], range: Range<usize>, _total: usize) -> Range<usize> {
+fn source_range(lines: &[Line], range: Range<usize>) -> Range<usize> {
     let start = lines.get(range.start).map_or_else(
         || lines.last().map_or(0, |line| line.index + 1),
         |line| line.index,
@@ -255,8 +255,8 @@ pub fn compare(left: &str, right: &str, options: &CompareOptions) -> Result<Comp
         deleted.extend(ar.clone());
         added.extend(br.clone());
         let mut difference = Difference {
-            left: source_range(&a, ar.clone(), left_count),
-            right: source_range(&b, br.clone(), right_count),
+            left: source_range(&a, ar.clone()),
+            right: source_range(&b, br.clone()),
             left_inline: Vec::new(),
             right_inline: Vec::new(),
         };
