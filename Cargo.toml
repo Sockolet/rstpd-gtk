@@ -1,6 +1,6 @@
 [package]
 name = "rstpd"
-version = "1.1.2"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A small, native Linux GTK3 text editor without plugins"

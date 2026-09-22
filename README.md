@@ -50,6 +50,8 @@ between platforms: filenames and locking semantics differ.
 | Area | Implementation |
 |---|---|
 | Native UI | GTK3 Adwaita menus, dialogs and controls; desktop scaling, light/dark/system preference, closeable tabs and a symbolic icon toolbar |
+| Tab management | Native drag reordering, pinned-left tabs, restored order/pins, and double-click after the last tab to create a document |
+| External changes | Background monitoring, automatic reload of clean files, and explicit confirmation before discarding unsaved edits |
 | Editor font | Native font-family and point-size chooser; per-workspace persistence across tabs and split panes |
 | Character counts | Unicode totals beside line/column, or selected characters out of the total for normal, multiple and rectangular selections |
 | Show symbols | Independent whitespace, EOL, non-printing/control markers, Show All, indent guides and wrap symbols, saved per workspace |
@@ -61,7 +63,8 @@ between platforms: filenames and locking semantics differ.
 | Document map | Clickable compact view with the visible text range highlighted; scroll the map for long documents |
 | Search | Normal, extended and advanced regex, including look-ahead/look-behind and pattern backreferences; case/whole-word options, wrap-around and replacement |
 | Find All | Current/all-open-document searches with grouped matches, highlighted snippets and a resizable, navigable bottom panel |
-| Compare | Debounced background comparison, changed-line and inline character highlighting, linked scrolling and difference navigation |
+| Find in Files | Folder/filter search, optional recursion/hidden files, background cancellation, and navigable disk results |
+| Compare | Live line/character differences, moved-line markers, aligned panes, ignore options, selected-line/clipboard/last-saved comparisons |
 | JSON | Lossless JSON/JSON5 pretty-print/minify, automatically refreshed tree, RFC 6901 pointers and source-span navigation |
 | Text operations | Upper/lower/title/sentence/inverted case; case-sensitive, case-insensitive, natural and exact decimal sorting; reverse/join, deduplication and whitespace operations |
 | Encoding | UTF-8, UTF-16/32 LE/BE, Windows/ISO/OEM code pages, Shift-JIS, EUC-JP, ISO-2022-JP, GBK/GB18030, Big5, EUC-KR, KOI8 and Mac encodings |
@@ -80,6 +83,50 @@ Editing either document automatically schedules a comparison refresh.
 Old worker results are discarded if the documents changed in the meantime;
 refresh does not move your editing caret. EOL representation is ignored during
 line comparison.
+
+### Tabs and external changes
+
+Drag tabs to reorder them. Right-click a tab for **Pin tab / Unpin tab** and
+**Move tab left/right**, or use **File > Pin / unpin tab**. The movement commands
+also use Ctrl+Shift+PageUp/PageDown. Pinned tabs form a left-hand group; neither
+dragging nor the movement commands can cross its boundary. Pinning does not
+make a document read-only. Order and pins persist in workspace recovery.
+Double-click the empty area after the last tab to create an untitled document.
+
+**View > Automatically reload external changes** is enabled by default and
+saved per workspace. A background worker polls named files about once a second,
+with periodic content checks for same-size/same-timestamp rewrites. Clean
+buffers reload automatically, preserving selection/caret/scroll where possible.
+Unsaved text or encoding/EOL changes require confirmation. Declining keeps
+the buffer and the existing save-conflict check; the same rejected disk version
+does not repeatedly prompt. Missing/unreadable files are reported, not loaded
+as empty documents. This is automatic refresh, not log-follow/tail mode.
+
+### Comparison options and sources
+
+**Tools > Compare options...** configures whitespace, case, empty-line and
+regex ignoring, moved-line detection and alignment. Options persist in the
+workspace. Ignore options decide which lines differ; inline spans retain
+original character coordinates. Red/green markers indicate left/right changes
+and blue markers identify matching moved lines. F7/Shift+F7 navigate groups.
+
+Alignment uses visual annotations and leading pane space without inserting text.
+It temporarily disables wrapping, restores the wrapping preference on clearing
+comparison, and supports at most 20,000 spacer rows. Disable alignment for
+larger gaps. Comparison preserves editing carets; stale worker results are
+discarded when the source documents or settings change.
+
+**Compare selected lines in both panes** requires two different split documents
+with one contiguous selection each and expands selections to complete lines.
+Edits end selection comparison; reselect before comparing again.
+**Compare with clipboard** and **Compare with last-saved file** create ordinary
+untitled snapshot tabs without overwriting source files. Whole-document
+comparisons continue updating after edits.
+
+This is independently implemented behavior inspired by
+[ComparePlus](https://github.com/pnedev/comparePlus), not ported plugin code.
+There is no plugin loading, Git/SVN integration, merge operation or multiple
+simultaneous comparison pairs.
 
 **View > Editor font...** selects the default editor font family and size
 (4–72 points) using GTK's installed-font chooser. The choice is saved with the
@@ -180,6 +227,29 @@ space, remaining selectable. These preferences affect both editing panes and
 new tabs, survive theme/font changes and restart, and do not modify text,
 encoding, dirty flags or undo history. Old sessions keep their previous control
 character visibility. The document map and search-results display stay uncluttered.
+
+## Find in Files
+
+Use **Search > Find in files...** (**Ctrl+Shift+F**). Enter **Folder:** or use
+**Choose folder...**, then set **File filters:** such as
+`*.rs;*.toml;!generated*`. `*` matches any filename characters, `?` matches one,
+spaces/semicolons separate patterns, and `!` excludes filenames. Filters apply
+to basenames, not directory paths, and are case-sensitive on Linux. Empty
+filters include all filenames. **Include subfolders** defaults on;
+**Include hidden files** defaults off.
+
+The **Find in files** button reuses the query, normal/extended/regex mode, case
+and whole-word options. Searches run in the background over disk contents,
+not unsaved buffers, and use the bottom result panel and its cancellation and
+navigation controls. A result verifies disk content before opening/selecting
+the match. Changed files and differing unsaved buffers are rejected without
+replacing the open text.
+
+Binary, linked, oversized and unreadable files are skipped with visible warnings.
+Limits are 16 MiB/file, 512 MiB total, 10,000 searched files, 100,000 visited
+entries, 30 seconds between checks and 10,000 retained matches. A running
+filesystem read or regex evaluation may delay cancellation. Folder-wide
+replacement is not implemented.
 
 ## Find All and search results
 

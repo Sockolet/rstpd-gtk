@@ -211,6 +211,8 @@ pub struct DocumentSnapshot {
     pub dirty: bool,
     pub disk_hash: Option<u64>,
     pub caret: usize,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -223,10 +225,18 @@ pub struct Session {
     pub editor_font: EditorFont,
     #[serde(default)]
     pub show_symbols: crate::symbols::ShowSymbols,
+    #[serde(default = "monitor_enabled")]
+    pub monitor_files: bool,
+    #[serde(default)]
+    pub compare_options: crate::comparison::CompareOptions,
     #[serde(default)]
     pub custom_languages: Vec<crate::udl::UserLanguage>,
     #[serde(default)]
     pub completion_api: Vec<crate::completion::Api>,
+}
+
+fn monitor_enabled() -> bool {
+    true
 }
 
 /// FNV-1a (64-bit). Pinned on purpose: this value is written to the recovery file and
@@ -546,6 +556,7 @@ pub fn load(path: &Path) -> Result<Session> {
         return Ok(Session {
             version: SESSION_VERSION,
             theme: "system".into(),
+            monitor_files: true,
             ..Session::default()
         });
     }
@@ -566,6 +577,7 @@ pub fn load(path: &Path) -> Result<Session> {
     if session.custom_languages.len() > 64 || session.completion_api.len() > 10_000 {
         return Err("Recovery language/completion definitions exceed their limits.".into());
     }
+    session.compare_options.validate()?;
     for language in &session.custom_languages {
         language.validate()?;
     }
@@ -713,9 +725,20 @@ mod tests {
             dirty: true,
             disk_hash: None,
             caret: 3,
+            pinned: true,
         });
+        session.monitor_files = true;
+        session.compare_options.ignore_case = true;
+        session.compare_options.ignore_regex = r"\d+".into();
         save(&path, &session).unwrap();
         assert_eq!(load(&path).unwrap().documents[0].text, "unsaved\0text");
+        let restored = load(&path).unwrap();
+        assert!(
+            restored.documents[0].pinned
+                && restored.monitor_files
+                && restored.compare_options.ignore_case
+        );
+        assert_eq!(restored.compare_options.ignore_regex, r"\d+");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         fs::remove_file(&path).unwrap();
         fs::remove_dir(&dir).unwrap();
@@ -977,6 +1000,7 @@ mod tests {
                     dirty: true,
                     disk_hash: Some(12345),
                     caret: 11,
+                    pinned: false,
                 }],
                 ..Session::default()
             };

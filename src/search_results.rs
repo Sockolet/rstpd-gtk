@@ -29,12 +29,15 @@ pub struct FileResults {
     pub revision: u64,
     pub title: String,
     pub hits: Vec<Hit>,
+    pub source: Option<crate::folder_search::DiskSource>,
 }
 pub struct Results {
     pub query: String,
     pub files: Vec<FileResults>,
     pub searched: usize,
     pub truncated: bool,
+    pub skipped: usize,
+    pub warnings: Vec<String>,
 }
 pub struct Link {
     pub file: usize,
@@ -95,7 +98,7 @@ impl LineCursor {
             let ch = text[self.position..]
                 .chars()
                 .next()
-                .expect("valid match position");
+                .expect("match boundary is in the document");
             self.position += ch.len_utf8();
             if ch == '\n' || (ch == '\r' && text.as_bytes().get(self.position) != Some(&b'\n')) {
                 self.line += 1;
@@ -172,6 +175,8 @@ pub fn find_all(
         files: Vec::new(),
         searched: 0,
         truncated: false,
+        skipped: 0,
+        warnings: Vec::new(),
     };
     let mut total = 0usize;
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -190,6 +195,7 @@ pub fn find_all(
             revision: input.revision,
             title: input.title,
             hits: Vec::new(),
+            source: None,
         };
         let mut cursor = LineCursor::new(&input.text, input.tab_width);
         search.visit_matches(&input.text, |range| {
@@ -228,11 +234,15 @@ impl Results {
     }
     pub fn summary(&self) -> String {
         let count = self.count();
-        if self.truncated {
-            format!("Showing the first {count} matches; more results exist. Narrow the search.")
+        let summary = if self.truncated {
+            format!(
+                "Showing the first {} matches; more results exist. Narrow the search.",
+                count
+            )
         } else {
             format!(
-                "{count} {} in {} {} ({} searched)",
+                "{} {} in {} {} ({} searched)",
+                count,
                 if count == 1 { "match" } else { "matches" },
                 self.files.len(),
                 if self.files.len() == 1 {
@@ -242,6 +252,11 @@ impl Results {
                 },
                 self.searched
             )
+        };
+        if self.skipped == 0 {
+            summary
+        } else {
+            format!("{summary}; {} skipped (see warnings)", self.skipped)
         }
     }
     pub fn render(&self) -> Rendered {
@@ -275,6 +290,16 @@ impl Results {
             1,
             0x400,
         );
+        for warning in &self.warnings {
+            line(
+                &mut text,
+                &mut styles,
+                &mut folds,
+                &format!("Skipped: {}", single_line(warning, 240)),
+                0,
+                0x400,
+            );
+        }
         for (index, file) in self.files.iter().enumerate() {
             line(
                 &mut text,
@@ -342,77 +367,78 @@ mod tests {
         }
     }
     #[test]
-    fn matches_keep_unicode_ranges_line_numbers_and_tab_columns() {
+    fn current_and_multi_document_results_have_exact_unicode_ranges() {
         let search = Search::new("cat", SearchMode::Literal, false, true).unwrap();
-        let result = find_all(
-            &search,
-            "cat".into(),
-            vec![
-                input(1, "\u{e9} cat\r\ncat\rcat\n"),
-                input(2, "no match"),
-                input(3, "\tCAT cat"),
-            ],
-            &AtomicBool::new(false),
-        )
-        .unwrap();
-        assert_eq!(result.count(), 5);
-        assert_eq!(result.searched, 3);
-        assert_eq!(result.files[0].hits[0].range, 3..6);
-        assert_eq!(result.files[0].hits[0].column, 3);
-        assert_eq!(result.files[0].hits[1].line, 2);
-        assert_eq!(result.files[0].hits[2].line, 3);
-        assert_eq!(result.files[1].hits[0].column, 5);
-        let rendered = result.render();
+        let inputs = vec![
+            input(1, "\u{e9} cat\r\ncat\rcat\n"),
+            input(2, "no match"),
+            input(3, "CAT cat"),
+        ];
+        let results = find_all(&search, "cat".into(), inputs, &AtomicBool::new(false)).unwrap();
+        assert_eq!(results.count(), 5);
+        assert_eq!(results.searched, 3);
+        assert_eq!(results.files.len(), 2);
+        assert_eq!(results.files[0].hits[0].range, 3..6);
+        assert_eq!(
+            (
+                results.files[0].hits[0].line,
+                results.files[0].hits[0].column
+            ),
+            (1, 3)
+        );
+        assert_eq!(results.files[0].hits[1].line, 2);
+        assert_eq!(results.files[0].hits[2].line, 3);
+        let rendered = results.render();
         assert_eq!(rendered.links.len(), 5);
         assert_eq!(rendered.text.len(), rendered.highlight.styles.len());
         assert_eq!(&rendered.text[rendered.emphasis[0].clone()], "cat");
     }
     #[test]
-    fn regex_multiline_extended_and_empty_matches_are_navigable() {
+    fn regex_extended_empty_and_multiline_matches_remain_navigable() {
         let search = Search::new(r"(?<=x)a\r\nb", SearchMode::Regex, true, false).unwrap();
-        let result = find_all(
+        let results = find_all(
             &search,
             "multiline".into(),
             vec![input(1, "xa\r\nb")],
             &AtomicBool::new(false),
         )
         .unwrap();
-        assert_eq!(result.files[0].hits[0].range, 1..5);
-        assert!(result.files[0].hits[0].preview.contains("continues"));
+        assert_eq!(results.files[0].hits[0].range, 1..5);
+        assert!(results.files[0].hits[0].preview.contains("continues"));
         let search = Search::new("^", SearchMode::Regex, true, false).unwrap();
-        let result = find_all(
+        let results = find_all(
             &search,
             "^".into(),
             vec![input(1, "a\nb")],
             &AtomicBool::new(false),
         )
         .unwrap();
-        assert_eq!(result.count(), 2);
-        assert_eq!(result.files[0].hits[1].line, 2);
+        assert_eq!(results.count(), 2);
+        assert_eq!(results.files[0].hits[1].line, 2);
         let search = Search::new(r"\t", SearchMode::Extended, true, false).unwrap();
-        let rendered = find_all(
+        let results = find_all(
             &search,
             r"\t".into(),
             vec![input(1, "a\tb")],
             &AtomicBool::new(false),
         )
-        .unwrap()
-        .render();
+        .unwrap();
+        let rendered = results.render();
         assert_eq!(&rendered.text[rendered.emphasis[0].clone()], "\\t");
     }
     #[test]
-    fn limits_cancellation_and_zero_results_are_explicit() {
+    fn result_limits_and_cancellation_are_explicit() {
         let search = Search::new("a", SearchMode::Literal, true, false).unwrap();
-        let result = find_all(
+        let results = find_all(
             &search,
             "a".into(),
             vec![input(1, &"a".repeat(MAX_HITS + 1))],
             &AtomicBool::new(false),
         )
         .unwrap();
-        assert_eq!(result.count(), MAX_HITS);
-        assert!(result.truncated);
-        assert!(result.files[0].hits.last().unwrap().preview.len() < 256);
+        assert_eq!(results.count(), MAX_HITS);
+        assert!(results.truncated);
+        assert!(results.files[0].hits.last().unwrap().preview.len() < 256);
         assert!(
             find_all(
                 &search,
@@ -433,5 +459,37 @@ mod tests {
             .count(),
             0
         );
+    }
+    #[test]
+    fn columns_respect_tabs_and_end_of_line_snippets_are_safe() {
+        let search = Search::new("cat", SearchMode::Literal, true, false).unwrap();
+        let results = find_all(
+            &search,
+            "cat".into(),
+            vec![input(1, "\tcat \u{e9}\tcat")],
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(results.files[0].hits[0].column, 5);
+        assert_eq!(results.files[0].hits[1].column, 13);
+        let search = Search::new(r"\r\n", SearchMode::Extended, true, false).unwrap();
+        let result = find_all(
+            &search,
+            "EOL".into(),
+            vec![input(1, "\r\n\r\n")],
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(result.count(), 2);
+        assert_eq!(result.files[0].hits[1].line, 2);
+        let search = Search::new(r"$", SearchMode::Regex, true, false).unwrap();
+        let result = find_all(
+            &search,
+            "end".into(),
+            vec![input(1, "cat")],
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(result.files[0].hits[0].range, 3..3);
     }
 }
