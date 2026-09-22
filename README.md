@@ -42,7 +42,7 @@ dropped onto the editor. Remote URLs are not opened or downloaded.
 Use `--` before filenames beginning with `-`.
 
 Recovery reads upstream version-1 and version-2 schemas and saves version 2,
-including language/completion definitions. Do not share a live session directory
+including language/completion definitions, font and symbol-display preferences. Do not share a live session directory
 between platforms: filenames and locking semantics differ.
 
 ## Features
@@ -51,6 +51,8 @@ between platforms: filenames and locking semantics differ.
 |---|---|
 | Native UI | GTK3 Adwaita menus, dialogs and controls; desktop scaling, light/dark/system preference, closeable tabs and a symbolic icon toolbar |
 | Editor font | Native font-family and point-size chooser; per-workspace persistence across tabs and split panes |
+| Character counts | Unicode totals beside line/column, or selected characters out of the total for normal, multiple and rectangular selections |
+| Show symbols | Independent whitespace, EOL, non-printing/control markers, Show All, indent guides and wrap symbols, saved per workspace |
 | Highlighting | All 94 source-language inventory entries mapped, plus the full pinned Lexilla catalog; filename detection, mode selection, and data-only UDL 2.0/2.1 import |
 | Markdown | CommonMark/GFM parsing with visible headings, emphasis, links, lists, quotes, tasks, tables, inline/fenced/indented code and strikethrough |
 | Completion | Keywords, local declarations, member/context suggestions, common built-in APIs, parameter hints and importable completion signatures |
@@ -58,6 +60,7 @@ between platforms: filenames and locking semantics differ.
 | Split screen | Two editable views of the same document or two different documents |
 | Document map | Clickable compact view with the visible text range highlighted; scroll the map for long documents |
 | Search | Normal, extended and advanced regex, including look-ahead/look-behind and pattern backreferences; case/whole-word options, wrap-around and replacement |
+| Find All | Current/all-open-document searches with grouped matches, highlighted snippets and a resizable, navigable bottom panel |
 | Compare | Debounced background comparison, changed-line and inline character highlighting, linked scrolling and difference navigation |
 | JSON | Lossless JSON/JSON5 pretty-print/minify, automatically refreshed tree, RFC 6901 pointers and source-span navigation |
 | Text operations | Upper/lower/title/sentence/inverted case; case-sensitive, case-insensitive, natural and exact decimal sorting; reverse/join, deduplication and whitespace operations |
@@ -93,6 +96,12 @@ preference continue to use Monospace at 11 points.
 Line operations affect complete selected lines, or the whole document when
 there is no selection. Case conversion operates on selected text, including
 rectangular/multiple selections. These edits participate in undo.
+Next to line and column, the status bar displays `4995 characters` normally or
+`852 of 4995 characters` for a selection. Counts follow the active editing pane,
+include all selected text without double-counting overlaps, and exclude virtual
+space. They count Unicode code points rather than UTF-8 bytes: `U+1F680` is one,
+combining marks are separate, and CR/LF count separately. A native document
+index keeps totals current without copying/rescanning the whole text on caret moves.
 Numeric sorting compares decimal digits without floating-point rounding, so
 large integer values remain correctly ordered. Every selected line must contain
 a decimal number; invalid input is reported before any edits are applied.
@@ -151,6 +160,63 @@ Both kinds of definitions persist in the session.
 
 The completion API import is associated with the active file's language.
 
+## Show symbols
+
+**View > Show symbols** provides independent checkable options:
+
+- **Show space and tab**: dots for spaces and arrows for tabs.
+- **Show end of line**: CR/LF markers for actual line-ending characters.
+- **Show non-printing characters**: named markers for Unicode/non-breaking spaces,
+  zero-width characters and directional formatting.
+- **Show control characters & Unicode EOL**: named C0/C1 control, DEL, NEL, LS and PS markers.
+- **Show all characters**: turns the preceding four options on together, or off
+  together when all are already enabled.
+- **Show indent guide**: vertical indentation guides.
+- **Show wrap symbol**: visual wrap markers when word wrap is enabled.
+
+Show All does not change guide/wrap settings. NEL/LS/PS display when either
+non-printing or control display is enabled. Hidden controls use an unboxed
+space, remaining selectable. These preferences affect both editing panes and
+new tabs, survive theme/font changes and restart, and do not modify text,
+encoding, dirty flags or undo history. Old sessions keep their previous control
+character visibility. The document map and search-results display stay uncluttered.
+
+## Find All and search results
+
+Open Find/Replace with **Ctrl+F** or **Ctrl+H**, enter a query, and use
+**Find all: current document** or **Find all: all open documents**. Both commands
+are also in **Search**. Searches use the same normal/extended/regex,
+case-sensitive and whole-word options as Find Next. Unsaved edits and unnamed
+tabs are included; unopened files on disk are not searched.
+
+The search form uses permanent mnemonic labels, framed entries and ordinary
+Adwaita buttons rather than flat labels. Actions have native hover, pressed,
+focus and disabled states in light/dark modes. The grid puts Find All on its
+own row so controls stay separated at smaller window sizes; no custom CSS is
+required.
+
+The bottom panel groups matches by document, showing line/column and highlighted
+snippets. Double-click or press **Enter** on a result to select the exact source
+range. **F4 / Shift+F4** or **Next / Previous** wraps through valid results.
+Document groups can be folded; drag the native divider to resize the panel.
+**Close** or **Escape** while the results editor is focused hides it without
+discarding results; **Ctrl+Alt+R** reopens it. **Clear** removes the list and
+**Cancel** interrupts an active search. Results are read-only, but can be selected
+and copied.
+
+Searching uses background document snapshots and does not move the editing caret.
+Changed/closed documents cannot be navigated using stale results: rerun Find All.
+Unaffected documents remain navigable. Multiline and zero-width matches are
+supported; snippets are bounded, but navigation selects the complete match.
+Columns count Unicode characters and honor tab stops. Each search replaces the
+previous list; results are transient and are not stored in recovery.
+
+Find All retains **10,000 matches**, reporting truncation explicitly. Limits:
+**16 MiB per document**, **64 MiB combined**, the existing per-document regex
+budget, and a ten-second batch budget checked between matches. Cancellation
+is checked between matches/documents; an in-progress regex evaluation may
+finish first. Errors are reported, not silently converted to zero matches.
+
 ## Keyboard
 
 | Shortcut | Action |
@@ -160,6 +226,9 @@ The completion API import is associated with the active file's language.
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
 | Ctrl+F or Ctrl+H | Find and replace |
 | F3 / Shift+F3 | Next / previous match |
+| Ctrl+Alt+Enter / Ctrl+Shift+Enter | Find All in current document / all open documents |
+| F4 / Shift+F4 | Next / previous Find All result |
+| Ctrl+Alt+R | Toggle search-results panel |
 | Ctrl+D / Ctrl+Shift+L | Select next / all occurrences |
 | Ctrl+U / Ctrl+Shift+U | Lowercase / uppercase selections |
 | Ctrl+Space / Ctrl+Shift+Space | Completion suggestions / function parameter hint |
@@ -167,7 +236,7 @@ The completion API import is associated with the active file's language.
 | F7 / Shift+F7 | Next / previous difference |
 | Ctrl+Alt+J / Ctrl+Alt+T | Format JSON / toggle JSON tree |
 | Ctrl+mouse wheel | Editor zoom |
-| Escape | Close search bar |
+| Escape | Close search bar, or hide search results when that panel is focused |
 
 Extended search/replacement recognizes `\n`, `\r`, `\t`, `\\`, `\0`,
 `\xHH` and `\uHHHH`. Invalid escapes are reported, not silently interpreted.
@@ -299,6 +368,10 @@ split/map views, search and replacement, comparison refresh, JSON navigation,
 encoding/EOL, imported definitions, completion and recovery. Native editor
 tests also exercise all lexers, Unicode/NUL handling, multiple selections,
 rectangular editing, undo, and visible Markdown styles in both palettes.
+They also cover persisted symbol preferences, Unicode/selection character
+counts, native search-control affordances/layout, read-only result navigation,
+cancellation and stale/closed-document behavior. Manually dispatched CI runs
+upload a verified Linux build artifact without creating a GitHub Release.
 
 For a per-user launcher, put `target/release/rstpd` on your `PATH` and install
 `assets/io.github.Sockolet.rstpd-gtk.desktop` under
@@ -318,6 +391,8 @@ is included. Keep the license and third-party notices with redistributed builds.
 - `src/syntax.rs`: shared semantic token roles and font-attribute selection.
 - `src/json_tools.rs`: bounded JSON/JSON5 validation and lossless formatting.
 - `src/core.rs`: portable encoding, bounded search, text transforms, diff and JSON spans.
+- `src/search_results.rs`: bounded multi-document matches, Unicode previews and result-row mappings.
+- `src/symbols.rs`: persisted display flags and non-printing character names.
 - `src/session.rs`: atomic persistence, Linux advisory locking and recovery worker.
 - `src/languages.rs`: app-owned language aliases and keyword selection.
 - `build.rs`: static native builds and build-time extraction of lexer constants,

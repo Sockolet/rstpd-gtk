@@ -6,7 +6,9 @@ use crate::{
     },
     editor::{self, DocumentHandle, Editor, Palette, sci::*},
     languages::{self, Language},
+    search_results::{self, Input as SearchInput, Link as ResultLink, Results as SearchResults},
     session::{self, DocumentSnapshot, RecoveryWorker, Session},
+    symbols::ShowSymbols,
     toolbar,
     udl::{self, Highlight},
 };
@@ -17,7 +19,11 @@ use std::{
     fs,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -71,6 +77,22 @@ const EOL_CR: usize = 1092;
 const ABOUT: usize = 1150;
 const SEARCH_CLOSE: usize = 1160;
 const COMPLETE: usize = 1161;
+const FIND_ALL_CURRENT: usize = 1170;
+const FIND_ALL_OPEN: usize = 1171;
+const RESULTS_TOGGLE: usize = 1172;
+const RESULTS_NEXT: usize = 1173;
+const RESULTS_PREVIOUS: usize = 1174;
+const RESULTS_CLEAR: usize = 1175;
+const RESULTS_CLOSE: usize = 1176;
+const RESULTS_CANCEL: usize = 1177;
+const RESULTS_ACTIVATE: usize = 1178;
+const SYMBOL_SPACE: usize = 1300;
+const SYMBOL_EOL: usize = 1301;
+const SYMBOL_NONPRINTING: usize = 1302;
+const SYMBOL_CONTROLS: usize = 1303;
+const SYMBOL_ALL: usize = 1304;
+const SYMBOL_INDENT: usize = 1305;
+const SYMBOL_WRAP: usize = 1306;
 const TITLE_CASE: usize = 1200;
 const SENTENCE_CASE: usize = 1201;
 const INVERT_CASE: usize = 1202;
@@ -149,6 +171,7 @@ thread_local! {
     static EVENTS: RefCell<VecDeque<Event>> = const { RefCell::new(VecDeque::new()) };
     static TABS_UPDATING: Cell<bool> = const { Cell::new(false) };
     static TREE_UPDATING: Cell<bool> = const { Cell::new(false) };
+    static SYMBOLS_UPDATING: Cell<bool> = const { Cell::new(false) };
 }
 
 enum Event {
@@ -169,6 +192,7 @@ enum Event {
     Uris(String),
     Map(i32),
     MapScroll(isize),
+    ResultActivate(usize),
     Error(String),
 }
 
@@ -293,28 +317,33 @@ struct SearchBar {
     mode: gtk::ComboBoxText,
     case: gtk::CheckButton,
     word: gtk::CheckButton,
+    buttons: Vec<(usize, gtk::Button)>,
     visible: bool,
 }
 
 impl SearchBar {
     fn new() -> Self {
         let container = gtk::Grid::new();
-        container.set_row_spacing(6);
+        container.set_row_spacing(8);
         container.set_column_spacing(8);
         container.set_margin_start(8);
         container.set_margin_end(8);
-        container.set_margin_top(6);
-        container.set_margin_bottom(6);
+        container.set_margin_top(8);
+        container.set_margin_bottom(8);
         let query = gtk::Entry::new();
         query.set_placeholder_text(Some("Find text or expression"));
         query.set_tooltip_text(Some("Find text or expression"));
         query.set_max_length(32768);
         query.set_hexpand(true);
+        query.set_has_frame(true);
+        query.set_width_chars(18);
         query.connect_activate(|_| queue(Event::Command(FIND_NEXT)));
         let replace = gtk::Entry::new();
         replace.set_placeholder_text(Some("Replace with"));
         replace.set_tooltip_text(Some("Replacement text; regex captures use $1 or ${name}"));
         replace.set_max_length(32768);
+        replace.set_hexpand(true);
+        replace.set_has_frame(true);
         replace.connect_activate(|_| queue(Event::Command(REPLACE)));
         let mode = gtk::ComboBoxText::new();
         for label in ["Normal", "Extended (\\n, \\t)", "Regex ($1 captures)"] {
@@ -323,21 +352,42 @@ impl SearchBar {
         mode.set_active(Some(0));
         let case = gtk::CheckButton::with_label("Match case");
         let word = gtk::CheckButton::with_label("Whole word");
-        container.attach(&query, 0, 0, 1, 1);
-        container.attach(&replace, 0, 1, 1, 1);
-        container.attach(&mode, 1, 0, 2, 1);
-        container.attach(&case, 1, 1, 1, 1);
-        container.attach(&word, 2, 1, 1, 1);
-        for (label, command, x, y) in [
-            ("Previous", FIND_PREVIOUS, 3, 0),
-            ("Next", FIND_NEXT, 4, 0),
-            ("Replace", REPLACE, 3, 1),
-            ("Replace all", REPLACE_ALL, 4, 1),
-            ("Close", SEARCH_CLOSE, 5, 0),
+        for (row, label, target) in [
+            (0, "_Find:", query.upcast_ref::<gtk::Widget>()),
+            (1, "_Replace:", replace.upcast_ref::<gtk::Widget>()),
+            (2, "_Mode:", mode.upcast_ref::<gtk::Widget>()),
         ] {
-            let button = gtk::Button::with_label(label);
-            button.connect_clicked(move |_| queue(Event::Command(command)));
-            container.attach(&button, x, y, 1, 1);
+            let label = gtk::Label::with_mnemonic(label);
+            label.set_xalign(0.0);
+            label.set_mnemonic_widget(Some(target));
+            container.attach(&label, 0, row, 1, 1);
+        }
+        container.attach(&query, 1, 0, 1, 1);
+        container.attach(&replace, 1, 1, 1, 1);
+        let options = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        options.pack_start(&mode, false, false, 0);
+        options.pack_start(&case, false, false, 0);
+        options.pack_start(&word, false, false, 0);
+        container.attach(&options, 1, 2, 2, 1);
+        let navigation = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let replacements = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let all = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        container.attach(&navigation, 2, 0, 1, 1);
+        container.attach(&replacements, 2, 1, 1, 1);
+        container.attach(&all, 1, 3, 2, 1);
+        let mut buttons = Vec::new();
+        for (label, command, row) in [
+            ("Previous", FIND_PREVIOUS, &navigation),
+            ("Next", FIND_NEXT, &navigation),
+            ("Close", SEARCH_CLOSE, &navigation),
+            ("Replace", REPLACE, &replacements),
+            ("Replace all", REPLACE_ALL, &replacements),
+            ("Find all: current document", FIND_ALL_CURRENT, &all),
+            ("Find all: all open documents", FIND_ALL_OPEN, &all),
+        ] {
+            let button = action_button(label, command);
+            row.pack_start(&button, false, false, 0);
+            buttons.push((command, button));
         }
         Self {
             container,
@@ -346,8 +396,115 @@ impl SearchBar {
             mode,
             case,
             word,
+            buttons,
             visible: false,
         }
+    }
+}
+
+fn action_button(label: &str, command: usize) -> gtk::Button {
+    let button = gtk::Button::with_label(label);
+    button.set_relief(gtk::ReliefStyle::Normal);
+    button.set_tooltip_text(Some(label));
+    button.connect_clicked(move |_| queue(Event::Command(command)));
+    button
+}
+
+struct SearchTask {
+    rx: mpsc::Receiver<Result<SearchResults>>,
+    cancelled: Arc<AtomicBool>,
+    discard: bool,
+}
+impl Drop for SearchTask {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+struct ResultPanel {
+    container: gtk::Box,
+    title: gtk::Label,
+    editor: Editor,
+    buttons: Vec<(usize, gtk::Button)>,
+    visible: bool,
+    data: Option<SearchResults>,
+    links: Vec<ResultLink>,
+    current: Option<usize>,
+    job: Option<SearchTask>,
+}
+impl ResultPanel {
+    fn new() -> Result<Self> {
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        header.set_margin_start(8);
+        header.set_margin_end(8);
+        header.set_margin_top(4);
+        header.set_margin_bottom(4);
+        let title = gtk::Label::new(Some("Search results"));
+        title.set_xalign(0.0);
+        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        title.set_width_chars(16);
+        title.set_max_width_chars(40);
+        header.pack_start(&title, true, true, 0);
+        let mut buttons = Vec::new();
+        for (label, command) in [
+            ("Previous", RESULTS_PREVIOUS),
+            ("Next", RESULTS_NEXT),
+            ("Cancel", RESULTS_CANCEL),
+            ("Clear", RESULTS_CLEAR),
+            ("Close", RESULTS_CLOSE),
+        ] {
+            let button = action_button(label, command);
+            if matches!(command, RESULTS_PREVIOUS | RESULTS_NEXT | RESULTS_CANCEL) {
+                button.set_sensitive(false);
+            }
+            header.pack_start(&button, false, false, 0);
+            buttons.push((command, button));
+        }
+        container.pack_start(&header, false, false, 0);
+        let editor = Editor::new()?;
+        editor.widget().set_size_request(-1, 90);
+        editor.widget().drag_dest_unset();
+        editor.set_read_only_text("Use Find All to search the current document or all open tabs.\nDouble-click a result or press Enter to navigate. F4 / Shift+F4: next / previous match.\n")?;
+        editor.connect_notify(|notification| {
+            if notification.code == SCN_DOUBLECLICK && notification.position >= 0 {
+                queue(Event::ResultActivate(notification.position as usize));
+            }
+        });
+        editor.widget().connect_key_press_event(|_, event| {
+            if !event
+                .state()
+                .intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::MOD1_MASK)
+            {
+                let command = match event.keyval() {
+                    gdk::keys::constants::Return | gdk::keys::constants::KP_Enter => {
+                        Some(RESULTS_ACTIVATE)
+                    }
+                    gdk::keys::constants::Escape => Some(RESULTS_CLOSE),
+                    _ => None,
+                };
+                if let Some(command) = command {
+                    queue(Event::Command(command));
+                    return glib::Propagation::Stop;
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        container.pack_start(editor.widget(), true, true, 0);
+        Ok(Self {
+            container,
+            title,
+            editor,
+            buttons,
+            visible: false,
+            data: None,
+            links: Vec::new(),
+            current: None,
+            job: None,
+        })
+    }
+    fn has_focus(&self) -> bool {
+        self.editor.widget().has_focus()
     }
 }
 
@@ -388,6 +545,8 @@ struct App {
     tab_ids: Rc<RefCell<Vec<u64>>>,
     status: gtk::Label,
     search: SearchBar,
+    content: gtk::Paned,
+    results: ResultPanel,
     tree: gtk::TreeView,
     tree_store: gtk::TreeStore,
     tree_scroll: gtk::ScrolledWindow,
@@ -406,6 +565,8 @@ struct App {
     palette: Palette,
     theme: String,
     editor_font: EditorFont,
+    show_symbols: ShowSymbols,
+    symbol_items: Vec<(usize, gtk::CheckMenuItem)>,
     desktop_settings: Option<gio::Settings>,
     fallback_dark: bool,
     map_visible: bool,
@@ -494,7 +655,10 @@ impl App {
         let search = SearchBar::new();
         root.pack_start(&search.container, false, false, 0);
         let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        root.pack_start(&body, true, true, 0);
+        let content = gtk::Paned::new(gtk::Orientation::Vertical);
+        content.set_wide_handle(true);
+        content.pack1(&body, true, false);
+        root.pack_start(&content, true, true, 0);
         let tree_store = gtk::TreeStore::new(&[String::static_type(), u32::static_type()]);
         let tree = gtk::TreeView::with_model(&tree_store);
         tree.set_headers_visible(false);
@@ -590,6 +754,8 @@ impl App {
             glib::Propagation::Stop
         });
         body.pack_end(&map_box, false, false, 0);
+        let results = ResultPanel::new()?;
+        content.pack2(&results.container, false, false);
         let status = gtk::Label::new(None);
         status.set_xalign(0.0);
         status.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -631,6 +797,8 @@ impl App {
             tab_ids,
             status,
             search,
+            content,
+            results,
             tree,
             tree_store,
             tree_scroll,
@@ -649,6 +817,8 @@ impl App {
             palette: Palette::new(false),
             theme: session.theme,
             editor_font: session.editor_font,
+            show_symbols: session.show_symbols,
+            symbol_items: Vec::new(),
             desktop_settings,
             fallback_dark,
             map_visible: false,
@@ -712,9 +882,11 @@ impl App {
         self.editors[1]
             .widget()
             .set_visible(self.secondary.is_some());
+        self.results.container.set_visible(self.results.visible);
     }
 
-    fn make_menu(&self) {
+    fn make_menu(&mut self) {
+        self.symbol_items.clear();
         for child in self.menu.children() {
             self.menu.remove(&child);
         }
@@ -755,6 +927,18 @@ impl App {
                     (FIND_NEXT, "Find next    F3"),
                     (FIND_PREVIOUS, "Find previous    Shift+F3"),
                     (REPLACE_ALL, "Replace all"),
+                    (
+                        FIND_ALL_CURRENT,
+                        "Find all in current document    Ctrl+Alt+Enter",
+                    ),
+                    (
+                        FIND_ALL_OPEN,
+                        "Find all in all open documents    Ctrl+Shift+Enter",
+                    ),
+                    (0, ""),
+                    (RESULTS_TOGGLE, "Search results panel    Ctrl+Alt+R"),
+                    (RESULTS_NEXT, "Next search result    F4"),
+                    (RESULTS_PREVIOUS, "Previous search result    Shift+F4"),
                 ],
             ),
             (
@@ -790,6 +974,32 @@ impl App {
             let menu = submenu(&self.menu, label);
             for (id, label) in *items {
                 menu_item(&menu, *id, label);
+            }
+            if *label == "_View" {
+                let symbols = submenu(&menu, "Show _symbols");
+                for (id, label) in [
+                    (SYMBOL_SPACE, "Show space and tab"),
+                    (SYMBOL_EOL, "Show end of line"),
+                    (SYMBOL_NONPRINTING, "Show non-printing characters"),
+                    (SYMBOL_CONTROLS, "Show control characters & Unicode EOL"),
+                    (SYMBOL_ALL, "Show all characters"),
+                    (0, ""),
+                    (SYMBOL_INDENT, "Show indent guide"),
+                    (SYMBOL_WRAP, "Show wrap symbol"),
+                ] {
+                    if id == 0 {
+                        menu_item(&symbols, 0, "");
+                        continue;
+                    }
+                    let item = gtk::CheckMenuItem::with_label(label);
+                    item.connect_activate(move |_| {
+                        if !SYMBOLS_UPDATING.with(Cell::get) {
+                            queue(Event::Command(id));
+                        }
+                    });
+                    symbols.append(&item);
+                    self.symbol_items.push((id, item));
+                }
             }
             if *label == "_Edit" {
                 let cases = submenu(&menu, "Case conversion");
@@ -888,6 +1098,31 @@ impl App {
         let help = submenu(&self.menu, "_Help");
         menu_item(&help, ABOUT, "About / keyboard help");
         self.menu.show_all();
+        self.update_symbol_checks();
+    }
+
+    fn update_symbol_checks(&self) {
+        SYMBOLS_UPDATING.with(|flag| flag.set(true));
+        for (id, item) in &self.symbol_items {
+            let checked = match *id {
+                SYMBOL_SPACE => self.show_symbols.whitespace,
+                SYMBOL_EOL => self.show_symbols.eol,
+                SYMBOL_NONPRINTING => self.show_symbols.non_printing,
+                SYMBOL_CONTROLS => self.show_symbols.controls,
+                SYMBOL_ALL => self.show_symbols.all_characters(),
+                SYMBOL_INDENT => self.show_symbols.indent_guides,
+                SYMBOL_WRAP => self.show_symbols.wrap_markers,
+                _ => unreachable!(),
+            };
+            item.set_active(checked);
+        }
+        SYMBOLS_UPDATING.with(|flag| flag.set(false));
+    }
+    fn apply_symbols(&self) {
+        for editor in &self.editors {
+            editor.show_symbols(self.show_symbols, self.palette);
+        }
+        self.update_symbol_checks();
     }
 
     fn apply_theme(&mut self) {
@@ -934,6 +1169,8 @@ impl App {
             }
             self.configure_map();
         }
+        self.apply_symbols();
+        self.theme_results();
     }
 
     fn choose_editor_font(&self) -> Result<Option<EditorFont>> {
@@ -1063,6 +1300,7 @@ impl App {
                 self.pane_ids[pane].set(0);
             }
         }
+        self.apply_symbols();
         self.configure_map();
         self.layout();
         Ok(())
@@ -1179,6 +1417,10 @@ impl App {
         let editor = self.editor();
         let line = editor.send(SCI_LINEFROMPOSITION, editor.position(), 0) + 1;
         let column = editor.send(SCI_GETCOLUMN, editor.position(), 0) + 1;
+        let characters = match editor.character_counts() {
+            Ok(counts) => counts.to_string(),
+            Err(error) => format!("Character count unavailable: {error}"),
+        };
         let state = if self.recovery_error.is_some() {
             "RECOVERY FAILED"
         } else if self.recovery_busy {
@@ -1189,7 +1431,7 @@ impl App {
             "Recovery pending"
         };
         let text = format!(
-            "Ln {line}, Col {column}   |   {} selections   |   {}   |   {}   {}   |   {state}   {}",
+            "Ln {line}, Col {column}   |   {characters}   |   {} selections   |   {}   |   {}   {}   |   {state}   {}",
             editor.send(SCI_GETSELECTIONS, 0, 0),
             self.languages[doc.language].name,
             doc.snapshot.encoding.label(),
@@ -1394,7 +1636,17 @@ impl App {
         if self.documents.len() == 1 {
             self.new_document()?;
         }
-        self.documents.remove(index);
+        let closed = self.documents.remove(index);
+        if self
+            .results
+            .data
+            .as_ref()
+            .is_some_and(|data| data.files.iter().any(|file| file.id == closed.snapshot.id))
+        {
+            self.results
+                .title
+                .set_text("A result document was closed - rerun Find All to refresh.");
+        }
         self.primary = if self.primary > index {
             self.primary - 1
         } else {
@@ -1450,6 +1702,7 @@ impl App {
             active: self.index(),
             theme: self.theme.clone(),
             editor_font: self.editor_font.clone(),
+            show_symbols: self.show_symbols,
             custom_languages: self
                 .languages
                 .iter()
@@ -1564,6 +1817,314 @@ impl App {
             self.find(false)?;
         }
         Ok(())
+    }
+
+    fn theme_results(&self) {
+        let editor = &self.results.editor;
+        editor.theme(&self.languages[0], self.palette);
+        editor.send(SCI_SETMARGINWIDTHN, 0, 0);
+        editor.send(SCI_SETMARGINWIDTHN, 1, 0);
+        editor.send(SCI_SETWRAPMODE, 0, 0);
+        editor.send(SCI_SETCARETLINEVISIBLE, 1, 0);
+        editor.send(SCI_STYLESETFORE, 1, self.palette.accent as isize);
+        editor.send(SCI_STYLESETBOLD, 1, 1);
+        editor.send(SCI_STYLESETBOLD, 2, 1);
+        editor.send(SCI_INDICSETSTYLE, search_results::MATCH_INDICATOR, 7);
+        editor.send(
+            SCI_INDICSETFORE,
+            search_results::MATCH_INDICATOR,
+            self.palette.accent as isize,
+        );
+        editor.send(SCI_INDICSETALPHA, search_results::MATCH_INDICATOR, 75);
+        editor.send(
+            SCI_INDICSETOUTLINEALPHA,
+            search_results::MATCH_INDICATOR,
+            140,
+        );
+        editor.send(SCI_INDICSETUNDER, search_results::MATCH_INDICATOR, 1);
+    }
+    fn result_message(&mut self, message: &str) {
+        self.results.title.set_text(message);
+        self.results.title.set_tooltip_text(Some(message));
+        self.note(message);
+    }
+    fn set_results_visible(&mut self, visible: bool) {
+        let opening = visible && !self.results.visible;
+        self.results.visible = visible;
+        self.layout();
+        if opening {
+            self.content
+                .set_position((self.content.allocated_height() - 240).max(100));
+        }
+    }
+    fn update_result_buttons(&self) {
+        for (command, button) in &self.results.buttons {
+            let enabled = match *command {
+                RESULTS_NEXT | RESULTS_PREVIOUS => !self.results.links.is_empty(),
+                RESULTS_CANCEL => self.results.job.is_some(),
+                _ => true,
+            };
+            button.set_sensitive(enabled);
+        }
+        for (command, button) in &self.search.buttons {
+            if matches!(*command, FIND_ALL_CURRENT | FIND_ALL_OPEN) {
+                button.set_sensitive(self.results.job.is_none());
+            }
+        }
+    }
+    fn start_find_all(&mut self, all_open: bool) -> Result<()> {
+        if self.results.job.is_some() {
+            self.set_results_visible(true);
+            self.note("Find All is still running. Cancel it before starting another search.");
+            return Ok(());
+        }
+        if self.search.query.text().is_empty() {
+            self.show_search()?;
+            if self.search.query.text().is_empty() {
+                self.note("Enter a search expression, then choose Find All.");
+                return Ok(());
+            }
+        }
+        let query = self.search.query.text().to_string();
+        let search = self.search_settings()?;
+        let mut bytes = 0usize;
+        let mut inputs = Vec::new();
+        for (index, doc) in self.documents.iter().enumerate() {
+            if !all_open && index != self.index() {
+                continue;
+            }
+            self.scratch.attach(&doc.handle);
+            let length = self.scratch.length();
+            if length > core::MAX_TOOL_BYTES {
+                return Err(format!(
+                    "{} exceeds the 16 MiB search limit. No documents were skipped or searched.",
+                    doc.snapshot.title
+                ));
+            }
+            bytes += length;
+            if bytes > search_results::MAX_BATCH_BYTES {
+                return Err("Find All is limited to 64 MiB across open documents. Close some tabs or search the current document.".into());
+            }
+            let title = doc
+                .snapshot
+                .path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| doc.snapshot.title.clone());
+            inputs.push(SearchInput {
+                id: doc.snapshot.id,
+                revision: doc.revision,
+                title,
+                text: self.scratch.text()?,
+                tab_width: self.scratch.send(SCI_GETTABWIDTH, 0, 0).max(1) as usize,
+            });
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let token = cancelled.clone();
+        let (tx, rx) = mpsc::channel();
+        self.results
+            .editor
+            .set_read_only_text("Searching open document snapshots...\n")?;
+        self.results
+            .editor
+            .clear_indicator(search_results::MATCH_INDICATOR);
+        self.results.data = None;
+        self.results.links.clear();
+        self.results.current = None;
+        self.set_results_visible(true);
+        std::thread::spawn(move || {
+            let result = search_results::find_all(&search, query, inputs, &token);
+            let _ = tx.send(result);
+        });
+        self.results.job = Some(SearchTask {
+            rx,
+            cancelled,
+            discard: false,
+        });
+        self.result_message(if all_open {
+            "Searching all open documents..."
+        } else {
+            "Searching current document..."
+        });
+        self.update_result_buttons();
+        Ok(())
+    }
+    fn apply_find_results(&mut self, results: SearchResults) -> Result<()> {
+        let rendered = results.render();
+        self.results.editor.set_read_only_text(&rendered.text)?;
+        self.theme_results();
+        self.results.editor.highlight(&rendered.highlight)?;
+        self.results
+            .editor
+            .clear_indicator(search_results::MATCH_INDICATOR);
+        for range in rendered.emphasis {
+            self.results
+                .editor
+                .indicator(search_results::MATCH_INDICATOR, range)?;
+        }
+        self.results.links = rendered.links;
+        self.results.current = None;
+        let stale = results.files.iter().any(|file| {
+            !self
+                .documents
+                .iter()
+                .any(|doc| doc.snapshot.id == file.id && doc.revision == file.revision)
+        });
+        let summary = results.summary()
+            + if stale {
+                " - some documents changed; rerun to navigate those matches."
+            } else {
+                " - double-click or Enter to navigate."
+            };
+        self.results.data = Some(results);
+        self.result_message(&summary);
+        self.update_result_buttons();
+        Ok(())
+    }
+    fn clear_find_results(&mut self) -> Result<()> {
+        if let Some(job) = &mut self.results.job {
+            job.cancelled.store(true, Ordering::Relaxed);
+            job.discard = true;
+        }
+        self.results
+            .editor
+            .set_read_only_text("Search results cleared. Run Find All to search again.\n")?;
+        self.results
+            .editor
+            .clear_indicator(search_results::MATCH_INDICATOR);
+        self.results.data = None;
+        self.results.links.clear();
+        self.results.current = None;
+        self.result_message("Search results cleared.");
+        self.update_result_buttons();
+        Ok(())
+    }
+    fn activate_result(&mut self, index: usize) -> Result<()> {
+        let Some(link) = self.results.links.get(index) else {
+            return Ok(());
+        };
+        let Some(results) = &self.results.data else {
+            return Ok(());
+        };
+        let file = &results.files[link.file];
+        let Some(document) = self
+            .documents
+            .iter()
+            .position(|doc| doc.snapshot.id == file.id)
+        else {
+            self.result_message("This result's document was closed. Run Find All again.");
+            return Ok(());
+        };
+        if self.documents[document].revision != file.revision {
+            self.result_message("This document changed since the search. Run Find All again before navigating its results.");
+            return Ok(());
+        }
+        let range = file.hits[link.hit].range.clone();
+        let row = link.row;
+        if self.comparing && document != self.index() {
+            self.clear_compare();
+        }
+        if document != self.index() {
+            self.switch(document)?;
+        }
+        self.editor().select(range);
+        self.editor().focus();
+        self.results.current = Some(index);
+        let editor = &self.results.editor;
+        editor.send(SCI_ENSUREVISIBLEENFORCEPOLICY, row, 0);
+        let start = editor.send(SCI_POSITIONFROMLINE, row, 0).max(0) as usize;
+        let end = editor
+            .send(SCI_GETLINEENDPOSITION, row, 0)
+            .max(start as isize) as usize;
+        editor.select(start..end);
+        self.set_results_visible(true);
+        self.result_message(&format!(
+            "Search result {} of {} (F4 / Shift+F4)",
+            index + 1,
+            self.results.links.len()
+        ));
+        Ok(())
+    }
+    fn activate_result_position(&mut self, position: usize) -> Result<()> {
+        let editor = &self.results.editor;
+        let row = editor.send(SCI_LINEFROMPOSITION, position.min(editor.length()), 0) as usize;
+        if let Some(index) = self.results.links.iter().position(|link| link.row == row) {
+            self.activate_result(index)?;
+        } else {
+            editor.send(SCI_TOGGLEFOLD, row, 0);
+        }
+        Ok(())
+    }
+    fn next_result(&mut self, previous: bool) -> Result<()> {
+        let count = self.results.links.len();
+        if count == 0 {
+            self.set_results_visible(true);
+            self.note("No search matches are listed. Run Find All first.");
+            return Ok(());
+        }
+        let index = match (self.results.current, previous) {
+            (None, false) => 0,
+            (None, true) => count - 1,
+            (Some(index), false) => (index + 1) % count,
+            (Some(index), true) => (index + count - 1) % count,
+        };
+        let valid = (0..count)
+            .map(|step| {
+                if previous {
+                    (index + count - step) % count
+                } else {
+                    (index + step) % count
+                }
+            })
+            .find(|candidate| {
+                let Some(results) = &self.results.data else {
+                    return false;
+                };
+                let file = &results.files[self.results.links[*candidate].file];
+                self.documents
+                    .iter()
+                    .any(|doc| doc.snapshot.id == file.id && doc.revision == file.revision)
+            });
+        self.activate_result(valid.unwrap_or(index))
+    }
+    fn poll_find_results(&mut self) -> Result<()> {
+        let Some(job) = &self.results.job else {
+            return Ok(());
+        };
+        let result = match job.rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Some(Err("Find All worker stopped unexpectedly.".into()))
+            }
+        };
+        let Some(result) = result else {
+            return Ok(());
+        };
+        let job = self.results.job.take().expect("active search task");
+        let cancelled = job.cancelled.load(Ordering::Relaxed);
+        let applied = (|| -> Result<()> {
+            if !job.discard {
+                match result {
+                    Ok(results) if !cancelled => self.apply_find_results(results)?,
+                    Ok(_) => {
+                        self.results
+                            .editor
+                            .set_read_only_text("Search cancelled.\n")?;
+                        self.result_message("Search cancelled.");
+                    }
+                    Err(error) => {
+                        self.results
+                            .editor
+                            .set_read_only_text(&format!("Find All: {error}\n"))?;
+                        self.result_message(&error);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        self.update_result_buttons();
+        applied
     }
 
     fn clear_compare(&mut self) {
@@ -1934,7 +2495,49 @@ impl App {
     }
 
     fn command(&mut self, command: usize) -> Result<()> {
-        let editor = self.editor();
+        let result_focus = self.results.has_focus();
+        if result_focus
+            && matches!(
+                command,
+                UNDO | REDO
+                    | CUT
+                    | PASTE
+                    | DUPLICATE
+                    | DELETE_LINE
+                    | UPPER
+                    | LOWER
+                    | TITLE_CASE
+                    | SENTENCE_CASE
+                    | INVERT_CASE
+                    | SORT
+                    | SORT_DESC
+                    | UNIQUE
+                    | TRIM
+                    | REMOVE_EMPTY
+                    | SORT_IGNORE_CASE
+                    | SORT_DESC_IGNORE_CASE
+                    | SORT_NATURAL
+                    | SORT_NUMERIC
+                    | SORT_NUMERIC_DESC
+                    | SORT_NUMERIC_COMMA
+                    | REVERSE_LINES
+                    | UNIQUE_ADJACENT
+                    | TRIM_START
+                    | TRIM_BOTH
+                    | REMOVE_EMPTY_ONLY
+                    | JOIN_LINES
+                    | ADD_NEXT
+                    | SELECT_MATCHES
+            )
+        {
+            self.note("Search results are read-only. Focus an editing pane to modify a document.");
+            return Ok(());
+        }
+        let editor = if result_focus && matches!(command, COPY | SELECT_ALL) {
+            self.results.editor.clone()
+        } else {
+            self.editor()
+        };
         match command {
             NEW => self.new_document()?,
             OPEN => {
@@ -2040,6 +2643,30 @@ impl App {
                 editor.focus();
             }
             FIND_NEXT | FIND_PREVIOUS => self.find(command == FIND_PREVIOUS)?,
+            FIND_ALL_CURRENT => self.start_find_all(false)?,
+            FIND_ALL_OPEN => self.start_find_all(true)?,
+            RESULTS_TOGGLE => {
+                self.set_results_visible(!self.results.visible);
+                if self.results.visible {
+                    self.results.editor.focus();
+                } else {
+                    self.editor().focus();
+                }
+            }
+            RESULTS_NEXT => self.next_result(false)?,
+            RESULTS_PREVIOUS => self.next_result(true)?,
+            RESULTS_ACTIVATE => self.activate_result_position(self.results.editor.position())?,
+            RESULTS_CLEAR => self.clear_find_results()?,
+            RESULTS_CLOSE => {
+                self.set_results_visible(false);
+                self.editor().focus();
+            }
+            RESULTS_CANCEL => {
+                if let Some(job) = &self.results.job {
+                    job.cancelled.store(true, Ordering::Relaxed);
+                    self.result_message("Cancelling search...");
+                }
+            }
             REPLACE | REPLACE_ALL => self.replace(command == REPLACE_ALL)?,
             SPLIT => {
                 self.clear_compare();
@@ -2065,6 +2692,25 @@ impl App {
                 for editor in &self.editors {
                     editor.send(SCI_SETWRAPMODE, self.wrap as usize, 0);
                 }
+            }
+            SYMBOL_SPACE | SYMBOL_EOL | SYMBOL_NONPRINTING | SYMBOL_CONTROLS | SYMBOL_ALL
+            | SYMBOL_INDENT | SYMBOL_WRAP => {
+                match command {
+                    SYMBOL_SPACE => self.show_symbols.whitespace = !self.show_symbols.whitespace,
+                    SYMBOL_EOL => self.show_symbols.eol = !self.show_symbols.eol,
+                    SYMBOL_NONPRINTING => {
+                        self.show_symbols.non_printing = !self.show_symbols.non_printing
+                    }
+                    SYMBOL_CONTROLS => self.show_symbols.controls = !self.show_symbols.controls,
+                    SYMBOL_ALL => self.show_symbols.toggle_all(),
+                    SYMBOL_INDENT => {
+                        self.show_symbols.indent_guides = !self.show_symbols.indent_guides
+                    }
+                    SYMBOL_WRAP => self.show_symbols.wrap_markers = !self.show_symbols.wrap_markers,
+                    _ => unreachable!(),
+                }
+                self.apply_symbols();
+                self.touch();
             }
             ZOOM_RESET => {
                 for editor in &self.editors {
@@ -2198,6 +2844,7 @@ impl App {
     }
 
     fn tick(&mut self) -> Result<()> {
+        self.poll_find_results()?;
         while let Ok((revision, result)) = self.recovery.rx.try_recv() {
             self.recovery_busy = false;
             match result {
@@ -2328,6 +2975,9 @@ impl App {
                 return Ok(());
             }
         }
+        if let Some(job) = &self.results.job {
+            job.cancelled.store(true, Ordering::Relaxed);
+        }
         self.exiting = true;
         self.window.hide();
         unsafe {
@@ -2384,6 +3034,10 @@ impl App {
                 }
             }
             Event::Escape => {
+                if self.results.has_focus() {
+                    self.command(RESULTS_CLOSE)?;
+                    return Ok(());
+                }
                 self.editor().send(SCI_AUTOCCANCEL, 0, 0);
                 self.editor().send(SCI_CALLTIPCANCEL, 0, 0);
                 if self.search.visible {
@@ -2457,6 +3111,16 @@ impl App {
                     doc.snapshot.dirty = dirty;
                     doc.revision += 1;
                     doc.last_edit = Instant::now();
+                    if self
+                        .results
+                        .data
+                        .as_ref()
+                        .is_some_and(|data| data.files.iter().any(|file| file.id == id))
+                    {
+                        self.results
+                            .title
+                            .set_text("Document changed - rerun Find All to refresh its results.");
+                    }
                     if self.json_document == Some(id) {
                         self.json_document = None;
                     }
@@ -2566,6 +3230,7 @@ impl App {
             Event::MapScroll(delta) => {
                 self.map.send(SCI_LINESCROLL, 0, delta);
             }
+            Event::ResultActivate(position) => self.activate_result_position(position)?,
         }
         Ok(())
     }
@@ -2605,6 +3270,11 @@ fn keyboard(event: &gdk::EventKey) -> glib::Propagation {
         (true, false, true, key::Right) => Some(SPLIT),
         (false, false, false, key::F3) => Some(FIND_NEXT),
         (false, true, false, key::F3) => Some(FIND_PREVIOUS),
+        (false, false, false, key::F4) => Some(RESULTS_NEXT),
+        (false, true, false, key::F4) => Some(RESULTS_PREVIOUS),
+        (true, false, true, key::Return | key::KP_Enter) => Some(FIND_ALL_CURRENT),
+        (true, true, false, key::Return | key::KP_Enter) => Some(FIND_ALL_OPEN),
+        (true, false, true, key::r) => Some(RESULTS_TOGGLE),
         (false, false, false, key::F7) => Some(DIFF_NEXT),
         (false, true, false, key::F7) => Some(DIFF_PREVIOUS),
         (true, false, false, key::space) => Some(COMPLETE),

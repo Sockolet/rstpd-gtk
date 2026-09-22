@@ -209,6 +209,262 @@ fn exercise_editor_font_selection(app: &mut App) {
     pump(app);
 }
 
+fn exercise_symbols_results_and_counts(app: &mut App) {
+    text(app, "A\u{e9}\u{1f680}\r\ne\u{301}\t\0\u{4e2d}");
+    assert!(app.status.text().contains("|   10 characters   |"));
+    app.editor().select(3..7);
+    pump(app);
+    assert!(app.status.text().contains("1 of 10 characters"));
+    let initial = app.editor().text().unwrap();
+    let before = (
+        app.editor().send(SCI_GETMODIFY, 0, 0),
+        app.editor().send(SCI_CANUNDO, 0, 0),
+    );
+    let all = app
+        .symbol_items
+        .iter()
+        .find(|(id, _)| *id == SYMBOL_ALL)
+        .unwrap()
+        .1
+        .clone();
+    all.activate();
+    pump(app);
+    assert!(app.show_symbols.all_characters());
+    app.command(SYMBOL_INDENT).unwrap();
+    app.command(SYMBOL_WRAP).unwrap();
+    app.command(SPLIT).unwrap();
+    pump(app);
+    for theme in [THEME_LIGHT, THEME_DARK] {
+        app.command(theme).unwrap();
+        pump(app);
+        for editor in &app.editors {
+            assert_eq!(editor.send(SCI_GETVIEWWS, 0, 0), 1);
+            assert_eq!(editor.send(SCI_GETVIEWEOL, 0, 0), 1);
+            assert_eq!(editor.send(SCI_GETINDENTATIONGUIDES, 0, 0), 3);
+            assert_eq!(editor.send(SCI_GETWRAPVISUALFLAGS, 0, 0), 1);
+            assert_eq!(editor.text().unwrap(), initial);
+        }
+    }
+    assert_eq!(
+        (
+            app.editor().send(SCI_GETMODIFY, 0, 0),
+            app.editor().send(SCI_CANUNDO, 0, 0)
+        ),
+        before
+    );
+    assert_eq!(app.map.send(SCI_GETVIEWWS, 0, 0), 0);
+    app.editors[0].select(3..7);
+    app.editors[1].select(0..3);
+    app.event(Event::OtherPane).unwrap();
+    pump(app);
+    assert!(app.status.text().contains("2 of 10 characters"));
+    app.event(Event::OtherPane).unwrap();
+    pump(app);
+    assert!(app.status.text().contains("1 of 10 characters"));
+    app.command(SYMBOL_EOL).unwrap();
+    assert!(
+        !app.symbol_items
+            .iter()
+            .find(|(id, _)| *id == SYMBOL_ALL)
+            .unwrap()
+            .1
+            .is_active()
+    );
+    app.command(SYMBOL_ALL).unwrap();
+    assert!(
+        app.symbol_items
+            .iter()
+            .find(|(id, _)| *id == SYMBOL_ALL)
+            .unwrap()
+            .1
+            .is_active()
+    );
+    app.command(SPLIT).unwrap();
+    pump(app);
+    let first = app.index();
+    let first_id = app.documents[first].snapshot.id;
+    text(app, "\u{e9} alpha\r\nalpha\n");
+    app.new_document().unwrap();
+    assert_eq!(app.editor().send(SCI_GETVIEWWS, 0, 0), 1);
+    assert!(app.status.text().contains("0 characters"));
+    text(app, "alpha beta alpha");
+    let second = app.index();
+    let second_id = app.documents[second].snapshot.id;
+    app.command(FIND).unwrap();
+    app.search.mode.set_active(Some(0));
+    app.search.query.set_text("alpha");
+    assert!(app.search.query.has_frame() && app.search.replace.has_frame());
+    for (_, button) in &app.search.buttons {
+        assert_eq!(button.relief(), gtk::ReliefStyle::Normal);
+    }
+    for (_, button) in &app.results.buttons {
+        assert_eq!(button.relief(), gtk::ReliefStyle::Normal);
+    }
+    for size in [(780, 600), (1280, 840)] {
+        app.window.resize(size.0, size.1);
+        wait_for(app, |app| app.search.query.allocated_width() > 100);
+        let controls: Vec<gtk::Widget> = vec![
+            app.search.query.clone().upcast(),
+            app.search.replace.clone().upcast(),
+            app.search.mode.clone().upcast(),
+            app.search.case.clone().upcast(),
+            app.search.word.clone().upcast(),
+        ]
+        .into_iter()
+        .chain(
+            app.search
+                .buttons
+                .iter()
+                .map(|(_, button)| button.clone().upcast()),
+        )
+        .collect();
+        for (i, control) in controls.iter().enumerate() {
+            let (x, y) = control
+                .translate_coordinates(&app.search.container, 0, 0)
+                .unwrap();
+            assert!(x >= 0 && y >= 0);
+            assert!(x + control.allocated_width() <= app.search.container.allocated_width());
+            for other in &controls[i + 1..] {
+                let (ox, oy) = other
+                    .translate_coordinates(&app.search.container, 0, 0)
+                    .unwrap();
+                assert!(
+                    !(x < ox + other.allocated_width()
+                        && ox < x + control.allocated_width()
+                        && y < oy + other.allocated_height()
+                        && oy < y + control.allocated_height()),
+                    "Search controls overlap"
+                );
+            }
+        }
+    }
+    app.search
+        .buttons
+        .iter()
+        .find(|(id, _)| *id == FIND_ALL_CURRENT)
+        .unwrap()
+        .1
+        .emit_clicked();
+    wait_for(app, |app| {
+        app.results.job.is_none() && app.results.data.is_some()
+    });
+    assert_eq!(app.results.data.as_ref().unwrap().count(), 2);
+    assert!(app.results.container.is_visible());
+    assert_eq!(app.results.editor.send(SCI_GETREADONLY, 0, 0), 1);
+    app.command(FIND_ALL_OPEN).unwrap();
+    wait_for(app, |app| app.results.job.is_none());
+    assert_eq!(app.results.data.as_ref().unwrap().count(), 4);
+    assert_eq!(app.results.data.as_ref().unwrap().files.len(), 2);
+    assert_eq!(app.results.links.len(), 4);
+    app.command(RESULTS_NEXT).unwrap();
+    pump(app);
+    assert_eq!(app.documents[app.index()].snapshot.id, first_id);
+    assert_eq!(app.editor().selection(), 3..8);
+    assert!(app.status.text().contains("5 of "));
+    app.command(RESULTS_NEXT).unwrap();
+    assert_eq!(
+        app.editor().range(app.editor().selection()).unwrap(),
+        "alpha"
+    );
+    app.command(RESULTS_NEXT).unwrap();
+    pump(app);
+    assert_eq!(app.documents[app.index()].snapshot.id, second_id);
+    assert_eq!(app.editor().selection(), 0..5);
+    app.command(RESULTS_PREVIOUS).unwrap();
+    pump(app);
+    assert_eq!(app.documents[app.index()].snapshot.id, first_id);
+    let row = app.results.links[2].row;
+    let position = app.results.editor.send(SCI_POSITIONFROMLINE, row, 0) as usize;
+    app.event(Event::ResultActivate(position)).unwrap();
+    pump(app);
+    assert_eq!(app.documents[app.index()].snapshot.id, second_id);
+    let divider = app.content.position();
+    app.content.set_position(divider.saturating_sub(40));
+    pump(app);
+    assert_ne!(app.content.position(), divider);
+    for theme in [THEME_LIGHT, THEME_DARK] {
+        app.command(theme).unwrap();
+        pump(app);
+        assert_eq!(app.results.editor.send(SCI_GETREADONLY, 0, 0), 1);
+        assert_eq!(
+            app.results.editor.send(SCI_STYLEGETBACK, 32, 0),
+            app.palette.background as isize
+        );
+    }
+    app.editor()
+        .select(app.editor().length()..app.editor().length());
+    app.editor()
+        .replace(app.editor().length()..app.editor().length(), "!")
+        .unwrap();
+    pump(app);
+    let caret = app.editor().position();
+    app.event(Event::ResultActivate(position)).unwrap();
+    assert!(app.note.contains("changed since the search"));
+    assert_eq!(app.editor().position(), caret);
+    app.command(RESULTS_TOGGLE).unwrap();
+    app.command(RESULTS_TOGGLE).unwrap();
+    pump(app);
+    assert!(
+        app.results.has_focus(),
+        "Results must receive keyboard focus"
+    );
+    let old_text = app.editor().text().unwrap();
+    app.command(PASTE).unwrap();
+    assert_eq!(app.editor().text().unwrap(), old_text);
+    app.command(SELECT_ALL).unwrap();
+    assert_eq!(
+        app.results.editor.selection(),
+        0..app.results.editor.length()
+    );
+    app.command(RESULTS_CLOSE).unwrap();
+    pump(app);
+    assert!(!app.results.container.is_visible());
+    app.command(UNDO).unwrap();
+    pump(app);
+    app.command(FIND_ALL_OPEN).unwrap();
+    wait_for(app, |app| app.results.job.is_none());
+    app.results
+        .editor
+        .send(SCI_GOTOLINE, app.results.links[2].row, 0);
+    app.command(RESULTS_ACTIVATE).unwrap();
+    pump(app);
+    assert_eq!(app.documents[app.index()].snapshot.id, second_id);
+    app.search.query.set_text("missing-text");
+    app.command(FIND_ALL_CURRENT).unwrap();
+    wait_for(app, |app| app.results.job.is_none());
+    assert_eq!(app.results.data.as_ref().unwrap().count(), 0);
+    app.command(FIND_ALL_OPEN).unwrap();
+    app.command(RESULTS_CANCEL).unwrap();
+    wait_for(app, |app| app.results.job.is_none());
+    assert_eq!(app.note, "Search cancelled.");
+    app.search.query.set_text("^");
+    app.search.mode.set_active(Some(2));
+    app.new_document().unwrap();
+    pump(app);
+    let empty = app.index();
+    app.command(FIND_ALL_CURRENT).unwrap();
+    wait_for(app, |app| app.results.job.is_none());
+    assert_eq!(app.results.data.as_ref().unwrap().count(), 1);
+    app.command(RESULTS_NEXT).unwrap();
+    pump(app);
+    assert_eq!(app.editor().selection(), 0..0);
+    app.remove_document(empty).unwrap();
+    pump(app);
+    app.command(RESULTS_NEXT).unwrap();
+    assert!(app.note.contains("document was closed"));
+    app.command(RESULTS_CLEAR).unwrap();
+    assert!(app.results.links.is_empty());
+    app.command(RESULTS_CLOSE).unwrap();
+    app.command(SEARCH_CLOSE).unwrap();
+    app.remove_document(second).unwrap();
+    pump(app);
+    assert_eq!(app.index(), first);
+    text(app, "");
+    app.search.query.set_text("");
+    app.search.mode.set_active(Some(0));
+    assert!(app.snapshot().unwrap().show_symbols.all_characters());
+}
+
 #[test]
 fn gtk_workflows_preserve_editing_features_and_recovery() {
     gtk::init().expect("Run GUI tests in a desktop session or with xvfb-run");
@@ -305,6 +561,7 @@ fn gtk_workflows_preserve_editing_features_and_recovery() {
     app.remove_document(0).unwrap();
     pump(&mut app);
     exercise_editor_font_selection(&mut app);
+    exercise_symbols_results_and_counts(&mut app);
 
     text(&mut app, "one\ntwo\n");
     app.command(SPLIT).unwrap();
@@ -680,6 +937,14 @@ fn gtk_workflows_preserve_editing_features_and_recovery() {
     assert_eq!(app.documents.len(), recovered_count);
     assert_eq!(app.editor().text().unwrap(), "recover me \u{1f680}");
     assert_eq!(app.editor().position(), 3);
+    assert!(app.show_symbols.all_characters());
+    assert_eq!(app.editor().send(SCI_GETVIEWWS, 0, 0), 1);
+    assert_eq!(app.editor().send(SCI_GETVIEWEOL, 0, 0), 1);
+    assert!(
+        !app.results.container.is_visible(),
+        "Search results are transient"
+    );
+    assert!(app.status.text().contains("12 characters"));
     assert!(app.documents[app.index()].snapshot.dirty);
     assert_eq!(app.editor_font, EditorFont::new("Sans", 1250).unwrap());
     assert_eq!(style_font(&app.editor(), 32), "Sans");
