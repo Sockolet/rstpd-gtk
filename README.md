@@ -97,6 +97,15 @@ dragging nor the movement commands can cross its boundary. Pinning does not
 make a document read-only. Order and pins persist in workspace recovery.
 Double-click the empty area after the last tab to create an untitled document.
 
+The tab context menu also provides **Open in split view**, which opens the
+right-clicked document in the other pane while keeping the active document
+in place. It reuses an existing split. **Compare with current view** compares
+the document active before the right-click against the clicked tab, not the
+next tab: the current document appears on the left and the clicked document
+on the right. Comparing a tab with itself is disabled. Both actions reuse
+existing documents and their unsaved edits without creating copies.
+Opening a normal split clears any active comparison.
+
 **View > Automatically reload external changes** is enabled by default and
 saved per workspace. A background worker polls named files about once a second,
 with periodic content checks for same-size/same-timestamp rewrites. Clean

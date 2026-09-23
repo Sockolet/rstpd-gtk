@@ -630,6 +630,130 @@ fn exercise_tab_order(app: &mut App) {
     pump(app);
 }
 
+fn tab_context_menu(app: &App, id: u64) -> gtk::Menu {
+    let current = app.documents[app.index()].snapshot.id;
+    let page = app
+        .tabs
+        .nth_page(Some(document_index(app, id) as u32))
+        .unwrap();
+    let tab = app.tabs.tab_label(&page).unwrap();
+    assert!(press(&tab, gdk::EventType::ButtonPress, 3));
+    assert_eq!(
+        app.documents[app.index()].snapshot.id,
+        current,
+        "Right-click must not select its target tab"
+    );
+    gtk::Menu::for_attach_widget(&tab)
+        .into_iter()
+        .find_map(|widget| widget.downcast::<gtk::Menu>().ok())
+        .expect("native tab context menu")
+}
+
+fn tab_context_item(menu: &gtk::Menu, label: &str) -> gtk::MenuItem {
+    menu.children()
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk::MenuItem>().ok())
+        .find(|item| item.label().as_deref() == Some(label))
+        .expect("tab action label")
+}
+
+fn activate_tab_context(app: &mut App, id: u64, label: &str) {
+    let menu = tab_context_menu(app, id);
+    let item = tab_context_item(&menu, label);
+    assert!(item.is_sensitive());
+    item.activate();
+    menu.popdown();
+    unsafe {
+        menu.destroy();
+    }
+    pump(app);
+}
+
+fn exercise_tab_context_actions(app: &mut App) {
+    let original = app.documents[app.index()].snapshot.id;
+    text(app, "current document\n");
+    app.new_document().unwrap();
+    let target = app.documents[app.index()].snapshot.id;
+    text(app, "target document\n");
+    app.editor().replace(0..0, "edited ").unwrap();
+    app.new_document().unwrap();
+    let unrelated = app.documents[app.index()].snapshot.id;
+    text(app, "unrelated document\n");
+    app.switch(document_index(app, original)).unwrap();
+    pump(app);
+    app.editor().select(1..4);
+    pump(app);
+    let selection = app.editor().selection();
+    let count = app.documents.len();
+    activate_tab_context(app, target, "Open in split view");
+    assert_eq!(app.pane_documents(), (original, Some(target)));
+    assert_eq!(app.focused, 0);
+    assert_eq!(app.editor().selection(), selection);
+    assert_eq!(app.editors[1].text().unwrap(), "edited target document\n");
+    assert_ne!(app.editors[1].send(SCI_CANUNDO, 0, 0), 0);
+    assert!(app.documents[document_index(app, target)].snapshot.dirty);
+    assert!(!app.comparing);
+
+    app.event(Event::OtherPane).unwrap();
+    pump(app);
+    activate_tab_context(app, unrelated, "Open in split view");
+    assert_eq!(app.pane_documents(), (unrelated, Some(target)));
+    assert_eq!(app.focused, 1, "The active right pane must stay active");
+    activate_tab_context(app, original, "Compare with current view");
+    wait_for(app, |app| {
+        app.compare_rx.is_none() && app.compare_due.is_none()
+    });
+    assert_eq!(app.compare_pair, Some([target, original]));
+    assert_eq!(app.pane_documents(), (target, Some(original)));
+    assert!(
+        app.editors[0].widget().has_focus(),
+        "Comparison must keep input focus on the current document"
+    );
+    assert!(!app.differences.is_empty());
+    assert_eq!(
+        app.documents.len(),
+        count,
+        "Context actions must reuse existing documents"
+    );
+    assert_eq!(app.editors[0].text().unwrap(), "edited target document\n");
+    assert_ne!(app.editors[0].send(SCI_CANUNDO, 0, 0), 0);
+
+    let menu = tab_context_menu(app, target);
+    assert!(!tab_context_item(&menu, "Compare with current view").is_sensitive());
+    menu.popdown();
+    unsafe {
+        menu.destroy();
+    }
+    assert!(app.event(Event::CompareTabs(target, target)).is_err());
+    assert_eq!(
+        app.compare_pair,
+        Some([target, original]),
+        "A rejected self-comparison must preserve the current pair"
+    );
+    assert!(app.event(Event::CompareTabs(target, u64::MAX)).is_err());
+    assert!(app.event(Event::SplitTab(u64::MAX)).is_err());
+    activate_tab_context(app, unrelated, "Open in split view");
+    assert!(!app.comparing);
+    assert_eq!(app.pane_documents(), (target, Some(unrelated)));
+    assert!(app.compare_pair.is_none());
+    for editor in &app.editors {
+        assert_eq!(
+            editor.send(SCI_MARKERGET, 0, 0) & ((1 << 20) | (1 << 21) | (1 << 22)),
+            0
+        );
+    }
+    app.command(SPLIT).unwrap();
+    while let Some(index) = app
+        .documents
+        .iter()
+        .position(|doc| doc.snapshot.id != original)
+    {
+        app.remove_document(index).unwrap();
+    }
+    app.switch(document_index(app, original)).unwrap();
+    text(app, "");
+}
+
 fn exercise_external_reload(app: &mut App, directory: &Path) {
     let original = app.documents[app.index()].snapshot.id;
     let path = directory.join("monitor.txt");
@@ -1297,6 +1421,7 @@ fn gtk_workflows_preserve_editing_features_and_recovery() {
     exercise_editor_font_selection(&mut app);
     exercise_symbols_results_and_counts(&mut app);
     exercise_tab_order(&mut app);
+    exercise_tab_context_actions(&mut app);
     exercise_external_reload(&mut app, &directory);
     exercise_folder_search(&mut app, &directory);
     exercise_compare_modes(&mut app, &directory);

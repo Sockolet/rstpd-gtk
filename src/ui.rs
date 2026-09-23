@@ -196,6 +196,8 @@ enum Event {
     CloseTab(u64),
     MoveTab(u64, usize),
     PinTab(u64),
+    SplitTab(u64),
+    CompareTabs(u64, u64),
     StepTab(u64, bool),
     NextTab(bool),
     OtherPane,
@@ -1572,6 +1574,42 @@ impl App {
         Ok(())
     }
 
+    fn split_tab(&mut self, id: u64) -> Result<()> {
+        let index = self
+            .documents
+            .iter()
+            .position(|doc| doc.snapshot.id == id)
+            .ok_or("This tab is no longer open.")?;
+        self.clear_compare();
+        let other = 1 - self.focused;
+        if other == 1 {
+            self.secondary = Some(index);
+        } else {
+            self.primary = index;
+        }
+        self.refresh_views()?;
+        self.editors[other].send(SCI_GOTOPOS, self.documents[index].snapshot.caret, 0);
+        self.update_tabs();
+        self.update_status();
+        self.editor().focus();
+        self.touch();
+        Ok(())
+    }
+
+    fn compare_tabs(&mut self, current: u64, target: u64) -> Result<()> {
+        let left = self
+            .documents
+            .iter()
+            .position(|doc| doc.snapshot.id == current)
+            .ok_or("The current document is no longer open.")?;
+        let right = self
+            .documents
+            .iter()
+            .position(|doc| doc.snapshot.id == target)
+            .ok_or("This tab is no longer open.")?;
+        self.begin_compare(left, right, None)
+    }
+
     fn configure_map(&self) {
         if self.documents.is_empty() {
             return;
@@ -1664,6 +1702,7 @@ impl App {
             tab.set_visible_window(false);
             tab.add(&row);
             let pinned = doc.snapshot.pinned;
+            let current = self.documents[self.index()].snapshot.id;
             tab.connect_button_press_event(move |tab, event| {
                 if event.button() != 3 {
                     return glib::Propagation::Proceed;
@@ -1675,13 +1714,18 @@ impl App {
                     (if pinned { "Unpin tab" } else { "Pin tab" }, 0),
                     ("Move tab left", 1),
                     ("Move tab right", 2),
+                    ("Open in split view", 3),
+                    ("Compare with current view", 4),
                 ] {
                     let item = gtk::MenuItem::with_label(label);
+                    item.set_sensitive(action != 4 || current != id);
                     item.connect_activate(move |_| {
                         queue(match action {
                             0 => Event::PinTab(id),
                             1 => Event::StepTab(id, true),
-                            _ => Event::StepTab(id, false),
+                            2 => Event::StepTab(id, false),
+                            3 => Event::SplitTab(id),
+                            _ => Event::CompareTabs(current, id),
                         })
                     });
                     menu.append(&item);
@@ -2811,6 +2855,7 @@ impl App {
         self.comparing = true;
         self.refresh_views()?;
         self.update_tabs();
+        self.editor().focus();
         self.compare_jump = true;
         self.launch_compare()
     }
@@ -3941,6 +3986,8 @@ impl App {
             }
             Event::MoveTab(id, requested) => self.move_tab(id, requested)?,
             Event::PinTab(id) => self.pin_tab(id),
+            Event::SplitTab(id) => self.split_tab(id)?,
+            Event::CompareTabs(current, target) => self.compare_tabs(current, target)?,
             Event::StepTab(id, previous) => {
                 if let Some(index) = self.documents.iter().position(|doc| doc.snapshot.id == id) {
                     let requested = if previous {
