@@ -2326,11 +2326,15 @@ impl App {
         }
         editor.text()
     }
+    fn search_text(&self, editor: &Editor) -> Result<String> {
+        Search::validate_size(editor.length())?;
+        editor.text()
+    }
 
     fn find(&mut self, previous: bool) -> Result<()> {
         let search = self.search_settings()?;
         let editor = self.editor();
-        let text = self.tool_text(&editor)?;
+        let text = self.search_text(&editor)?;
         let selection = editor.selection();
         let key = format!(
             "{}:{:?}:{}:{}",
@@ -2377,7 +2381,7 @@ impl App {
     fn replace(&mut self, all: bool) -> Result<()> {
         let search = self.search_settings()?;
         let editor = self.editor();
-        let text = self.tool_text(&editor)?;
+        let text = self.search_text(&editor)?;
         let replacement = self.search.replace.text();
         if all {
             let (out, count) = search.replace_all(&text, &replacement)?;
@@ -2474,15 +2478,15 @@ impl App {
             }
             self.scratch.attach(&doc.handle);
             let length = self.scratch.length();
-            if length > core::MAX_TOOL_BYTES {
-                return Err(format!(
-                    "{} exceeds the 16 MiB search limit. No documents were skipped or searched.",
+            Search::validate_size(length).map_err(|error| {
+                format!(
+                    "{}: {error} No documents were searched.",
                     doc.snapshot.title
-                ));
-            }
+                )
+            })?;
             bytes += length;
             if bytes > search_results::MAX_BATCH_BYTES {
-                return Err("Find All is limited to 64 MiB across open documents. Close some tabs or search the current document.".into());
+                return Err("Find All is limited to 256 MiB across open documents. Close some tabs or search the current document.".into());
             }
             let title = doc
                 .snapshot
@@ -3764,7 +3768,7 @@ impl App {
                     concat!(
                         "rstpd ",
                         env!("CARGO_PKG_VERSION"),
-                        "\nNative GTK3 application with statically linked Scintilla + Lexilla.\nStock Adwaita; no plugins, script host or updater.\n\nAlt+drag: rectangular selection\nCtrl+click: multiple carets\nCtrl+D / Ctrl+Shift+L: next / all occurrences\nF6: other pane; Ctrl+Tab: next tab\nCtrl+Space: completion; Ctrl+Shift+Space: function parameters\nCtrl+mouse wheel: zoom\nCtrl+Alt+J: format JSON/JSON5; Ctrl+Alt+T: JSON tree\nF7 / Shift+F7: next / previous difference\n\nCompare, JSON and Markdown refresh after edits.\nLanguage menu: import data-only language/API XML.\nClose the app to preserve all tabs, including unsaved text.\nRecovery is local plaintext in $XDG_STATE_HOME/rstpd-gtk\n(or ~/.local/state/rstpd-gtk), unless --session-dir is supplied.\nFiles: 128 MiB; search, line and JSON tools: 16 MiB.\n\nIndependent application; not affiliated with Notepad++."
+                        "\nNative GTK3 application with statically linked Scintilla + Lexilla.\nStock Adwaita; no plugins, script host or updater.\n\nAlt+drag: rectangular selection\nCtrl+click: multiple carets\nCtrl+D / Ctrl+Shift+L: next / all occurrences\nF6: other pane; Ctrl+Tab: next tab\nCtrl+Space: completion; Ctrl+Shift+Space: function parameters\nCtrl+mouse wheel: zoom\nCtrl+Alt+J: format JSON/JSON5; Ctrl+Alt+T: JSON tree\nF7 / Shift+F7: next / previous difference\n\nCompare, JSON and Markdown refresh after edits.\nLanguage menu: import data-only language/API XML.\nClose the app to preserve all tabs, including unsaved text.\nRecovery is local plaintext in $XDG_STATE_HOME/rstpd-gtk\n(or ~/.local/state/rstpd-gtk), unless --session-dir is supplied.\nFiles: 256 MiB; search/replace: 128 MiB; line and JSON tools: 16 MiB.\n\nIndependent application; not affiliated with Notepad++."
                     ),
                     gtk::MessageType::Info,
                     &[("_Close", gtk::ResponseType::Close)],
@@ -4124,7 +4128,7 @@ impl App {
                     if self.scratch.length() > core::MAX_DOCUMENT_BYTES {
                         self.scratch.send(SCI_UNDO, 0, 0);
                         return Err(
-                            "The edit was undone because it exceeded the 128 MiB document limit."
+                            "The edit was undone because it exceeded the 256 MiB document limit."
                                 .into(),
                         );
                     }

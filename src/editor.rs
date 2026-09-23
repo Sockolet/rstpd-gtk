@@ -628,7 +628,7 @@ impl Editor {
     pub fn replace(&self, range: Range<usize>, text: &str) -> Result<()> {
         self.validate_range(&range)?;
         if self.length().saturating_sub(range.len()) + text.len() > MAX_DOCUMENT_BYTES {
-            return Err("This edit would exceed the 128 MiB document limit.".into());
+            return Err("This edit would exceed the 256 MiB document limit.".into());
         }
         self.send(SCI_SETSTATUS, 0, 0);
         self.send(SCI_SETTARGETSTART, range.start, 0);
@@ -669,7 +669,7 @@ impl Editor {
             .iter()
             .fold(self.length(), |len, (r, s)| len - r.len() + s.len());
         if total > MAX_DOCUMENT_BYTES {
-            return Err("This edit would exceed 128 MiB.".into());
+            return Err("This edit would exceed 256 MiB.".into());
         }
         self.send(SCI_BEGINUNDOACTION, 0, 0);
         let result = edits

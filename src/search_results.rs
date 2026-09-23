@@ -1,4 +1,4 @@
-use crate::core::{Highlight, MAX_TOOL_BYTES, Result, Search};
+use crate::core::{Highlight, Result, Search};
 use std::{
     ops::Range,
     sync::atomic::{AtomicBool, Ordering},
@@ -6,7 +6,7 @@ use std::{
 };
 
 pub const MAX_HITS: usize = 10_000;
-pub const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_BATCH_BYTES: usize = 256 * 1024 * 1024;
 pub const MATCH_INDICATOR: usize = 24;
 
 pub struct Input {
@@ -163,13 +163,13 @@ pub fn find_all(
     inputs: Vec<Input>,
     cancelled: &AtomicBool,
 ) -> Result<Results> {
-    if inputs
+    let Some(bytes) = inputs
         .iter()
         .try_fold(0usize, |total, input| total.checked_add(input.text.len()))
-        .is_none_or(|total| total > MAX_BATCH_BYTES)
-    {
-        return Err("Find All is limited to 64 MiB across the selected open documents.".into());
-    }
+        .filter(|total| *total <= MAX_BATCH_BYTES)
+    else {
+        return Err("Find All is limited to 256 MiB across the selected open documents.".into());
+    };
     let mut result = Results {
         query,
         files: Vec::new(),
@@ -179,7 +179,8 @@ pub fn find_all(
         warnings: Vec::new(),
     };
     let mut total = 0usize;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline =
+        Instant::now() + Duration::from_secs(10 * bytes.div_ceil(64 * 1024 * 1024).max(1) as u64);
     for input in inputs {
         if cancelled.load(Ordering::Relaxed) {
             return Err("Search cancelled.".into());
@@ -187,9 +188,8 @@ pub fn find_all(
         if Instant::now() > deadline {
             return Err("Find All exceeded its processing budget. Narrow the search.".into());
         }
-        if input.text.len() > MAX_TOOL_BYTES {
-            return Err(format!("{} exceeds the 16 MiB search limit.", input.title));
-        }
+        Search::validate_size(input.text.len())
+            .map_err(|error| format!("{}: {error}", input.title))?;
         let mut file = FileResults {
             id: input.id,
             revision: input.revision,

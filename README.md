@@ -29,7 +29,7 @@ application code or plugin code is included.
 Download the Linux x86_64 archive and its SHA-256 checksum from
 [Releases](https://github.com/Sockolet/rstpd-gtk/releases/latest), or build from
 source using the instructions below. Verify the archive with
-`sha256sum -c rstpd-1.2.0-linux-x86_64.tar.gz.sha256`, extract it, and run
+`sha256sum -c rstpd-1.3.0-linux-x86_64.tar.gz.sha256`, extract it, and run
 `./rstpd` from the extracted directory. GTK3 must be installed on the system;
 the upstream Windows ZIP is not a Linux package.
 
@@ -259,7 +259,7 @@ the match. Changed files and differing unsaved buffers are rejected without
 replacing the open text.
 
 Binary, linked, oversized and unreadable files are skipped with visible warnings.
-Limits are 16 MiB/file, 512 MiB total, 10,000 searched files, 100,000 visited
+Limits are 128 MiB/file (including decoded UTF-8), 512 MiB total, 10,000 searched files, 100,000 visited
 entries, 30 seconds between checks and 10,000 retained matches. A running
 filesystem read or regex evaluation may delay cancellation. Folder-wide
 replacement is not implemented.
@@ -295,8 +295,10 @@ Columns count Unicode characters and honor tab stops. Each search replaces the
 previous list; results are transient and are not stored in recovery.
 
 Find All retains **10,000 matches**, reporting truncation explicitly. Limits:
-**16 MiB per document**, **64 MiB combined**, the existing per-document regex
-budget, and a ten-second batch budget checked between matches. Cancellation
+**128 MiB per document**, **256 MiB combined**. Match collection and replacement
+phases allow two seconds per 16 MiB of input (up to 16 seconds); Find All allows
+ten seconds per 64 MiB combined (up to 40 seconds). Budgets are checked between
+matches, not hard execution deadlines. Cancellation
 is checked between matches/documents; an in-progress regex evaluation may
 finish first. Errors are reported, not silently converted to zero matches.
 
@@ -328,7 +330,7 @@ word boundaries. Replacement captures use `$1` or `${name}`; `$$` is a
 literal dollar. Look-around and pattern backreferences are supported, for
 example `(?<=prefix:)(\w+)\s+\1(?!x)`. This is not complete Boost/PCRE dialect
 compatibility. Backtracking is limited to 500,000 steps, bulk operations check
-a two-second processing budget, and oversized expansions fail before replacing
+input-scaled processing budgets (two seconds per 16 MiB), and oversized expansions fail before replacing
 the document. Regex errors are reported, not treated as "no match".
 
 ## Recovery and data safety
@@ -379,10 +381,12 @@ Conversions that cannot represent every character are rejected.
 
 ## Deliberate boundaries
 
-- Maximum document size: 128 MiB, including decoded UTF-8 text.
-- Search, line operations and JSON tools: 16 MiB. Compare: 16 MiB combined.
+- Maximum document size: 256 MiB, including decoded UTF-8 text.
+- Find/replace and directory search: 128 MiB per document/file; Find All: 256 MiB combined.
+- Line operations and JSON tools: 16 MiB. Compare: 16 MiB combined.
 - Search/replacement expressions: 32 KiB; capture expansion is size-bounded.
-- Recovery file: 256 MiB; at most 256 tabs. Failed backups are visible in the status bar.
+- Recovery file: 512 MiB; at most 256 tabs. Failed backups are visible in the status bar.
+- Larger files require additional memory for decoding, editor storage, undo and search/recovery snapshots; limits are not a memory-availability guarantee. Older releases may reject recovery files above their former 256 MiB limit.
 - JSON trees: 20,000 nodes and 128 nesting levels. Duplicate
   object keys are rejected to prevent silent data loss. Number spellings and
   object key order are preserved. JSON and JSON5 are supported.

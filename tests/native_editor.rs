@@ -299,6 +299,14 @@ fn native_editing_unicode_split_selection_highlighting_and_undo() {
         left.clear_diff();
         assert_eq!(left.send(SCI_ANNOTATIONGETLINES, 0, 0), 0);
         assert_eq!(left.send(SCI_MARKERGET, 0, 0) & (1 << 22), 0);
+        let line = "x".repeat(1023) + "\n";
+        let large_text = line.repeat(MAX_DOCUMENT_BYTES / line.len());
+        left.set_text(&large_text).unwrap();
+        assert_eq!(left.length(), MAX_DOCUMENT_BYTES);
+        assert_eq!(right.length(), MAX_DOCUMENT_BYTES);
+        assert!(left.replace(left.length()..left.length(), "x").is_err());
+        left.set_text(&text_before_padding).unwrap();
+        drop(large_text);
         left.clear_styles();
         assert_eq!(left.send(SCI_GETENDSTYLED, 0, 0) as usize, left.length());
         assert_eq!(left.send(SCI_GETSTYLEAT, text.find("say").unwrap(), 0), 0);

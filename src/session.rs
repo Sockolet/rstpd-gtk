@@ -10,6 +10,7 @@ use std::{
 };
 
 pub const SESSION_VERSION: u32 = 2;
+pub const MAX_RECOVERY_BYTES: usize = 512 * 1024 * 1024;
 
 /// Uses an absolute XDG state root, or an absolute HOME when XDG is unset/relative.
 #[cfg(target_os = "linux")]
@@ -560,7 +561,7 @@ pub fn load(path: &Path) -> Result<Session> {
             ..Session::default()
         });
     }
-    let bytes = read_bounded(path, MAX_DOCUMENT_BYTES * 2)?;
+    let bytes = read_bounded(path, MAX_RECOVERY_BYTES)?;
     let session: Session = serde_json::from_slice(&bytes)
         .map_err(|e| format!("Recovery file is invalid; it has not been changed: {e}"))?;
     if !matches!(session.version, 1 | SESSION_VERSION) {
@@ -599,9 +600,9 @@ pub fn save(path: &Path, session: &Session) -> Result<()> {
     struct BoundedOutput(Vec<u8>);
     impl Write for BoundedOutput {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if self.0.len() + bytes.len() > MAX_DOCUMENT_BYTES * 2 {
+            if self.0.len() + bytes.len() > MAX_RECOVERY_BYTES {
                 return Err(std::io::Error::other(
-                    "Recovery exceeds 256 MiB. Save and close some documents.",
+                    "Recovery exceeds 512 MiB. Save and close some documents.",
                 ));
             }
             self.0.extend_from_slice(bytes);

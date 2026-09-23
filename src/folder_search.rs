@@ -1,5 +1,5 @@
 use crate::{
-    core::{self, MAX_TOOL_BYTES, Result, Search},
+    core::{self, MAX_SEARCH_BYTES, Result, Search},
     search_results::{self, Input, MAX_HITS, Results},
     session,
 };
@@ -80,7 +80,7 @@ fn patterns(filters: &str) -> Result<Filter> {
     Ok(filter)
 }
 fn text_file(path: &Path) -> Result<(Vec<u8>, String)> {
-    let bytes = session::read_bounded(path, MAX_TOOL_BYTES)?;
+    let bytes = session::read_bounded(path, MAX_SEARCH_BYTES)?;
     let unicode = bytes.starts_with(b"\xff\xfe")
         || bytes.starts_with(b"\xfe\xff")
         || bytes.starts_with(b"\0\0\xfe\xff");
@@ -88,6 +88,7 @@ fn text_file(path: &Path) -> Result<(Vec<u8>, String)> {
         return Err("binary file (NUL bytes without a Unicode BOM)".into());
     }
     let (text, _) = core::decode(&bytes, None)?;
+    Search::validate_size(text.len())?;
     if text
         .chars()
         .take(8192)
@@ -214,8 +215,8 @@ pub fn find_in_files(
             {
                 continue;
             }
-            if metadata.len() > MAX_TOOL_BYTES as u64 {
-                warn(&mut results, &path, "exceeds the 16 MiB file limit");
+            if metadata.len() > MAX_SEARCH_BYTES as u64 {
+                warn(&mut results, &path, "exceeds the 128 MiB search file limit");
                 continue;
             }
             if results.searched >= 10_000 {

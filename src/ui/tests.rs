@@ -754,6 +754,49 @@ fn exercise_tab_context_actions(app: &mut App) {
     text(app, "");
 }
 
+fn exercise_large_search(app: &mut App) {
+    let original = app.documents[app.index()].snapshot.id;
+    app.new_document().unwrap();
+    let large = app.documents[app.index()].snapshot.id;
+    let size = 50 * 1024 * 1024;
+    let needle = "SEARCH-98765";
+    let line = "ordinary log entry\n";
+    let mut value = line.repeat(size / line.len() + 1);
+    value.truncate(size);
+    let last = size - needle.len();
+    value.replace_range(0..needle.len(), needle);
+    value.replace_range(last..size, needle);
+    text(app, &value);
+    drop(value);
+    app.search.query.set_text(needle);
+    app.search.mode.set_active(Some(0));
+    app.search.case.set_active(true);
+    app.search.word.set_active(false);
+    app.editor().select(0..0);
+    app.command(FIND_NEXT).unwrap();
+    assert_eq!(app.editor().selection(), 0..needle.len());
+    app.command(FIND_NEXT).unwrap();
+    assert_eq!(app.editor().selection(), last..size);
+    app.command(FIND_PREVIOUS).unwrap();
+    assert_eq!(app.editor().selection(), 0..needle.len());
+    app.command(FIND_ALL_CURRENT).unwrap();
+    wait_for(app, |app| app.results.job.is_none());
+    assert_eq!(app.results.data.as_ref().unwrap().count(), 2);
+    app.command(RESULTS_NEXT).unwrap();
+    app.command(RESULTS_NEXT).unwrap();
+    assert_eq!(app.editor().selection(), last..size);
+    app.search.replace.set_text("FOUND!-98765");
+    app.command(REPLACE_ALL).unwrap();
+    assert_eq!(app.editor().range(0..needle.len()).unwrap(), "FOUND!-98765");
+    app.command(UNDO).unwrap();
+    assert_eq!(app.editor().range(0..needle.len()).unwrap(), needle);
+    app.command(RESULTS_CLEAR).unwrap();
+    app.command(RESULTS_CLOSE).unwrap();
+    app.remove_document(document_index(app, large)).unwrap();
+    app.switch(document_index(app, original)).unwrap();
+    pump(app);
+}
+
 fn exercise_external_reload(app: &mut App, directory: &Path) {
     let original = app.documents[app.index()].snapshot.id;
     let path = directory.join("monitor.txt");
@@ -1425,6 +1468,7 @@ fn gtk_workflows_preserve_editing_features_and_recovery() {
     exercise_external_reload(&mut app, &directory);
     exercise_folder_search(&mut app, &directory);
     exercise_compare_modes(&mut app, &directory);
+    exercise_large_search(&mut app);
 
     text(&mut app, "one\ntwo\n");
     app.command(SPLIT).unwrap();
