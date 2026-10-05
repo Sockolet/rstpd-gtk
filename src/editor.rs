@@ -968,11 +968,11 @@ impl Editor {
             .max(1)
             .to_string()
             .len()
-            .max(4);
-        let sample = CString::new("9".repeat(digits)).expect("decimal digits");
-        let width = unsafe { self.send_raw(SCI_TEXTWIDTH, 33, sample.as_ptr() as isize) }
-            .saturating_add(12)
-            .max(52);
+            .max(2);
+        let sample = CString::new("9".repeat(digits)).expect("line-number digits");
+        let measured = unsafe { self.send_raw(SCI_TEXTWIDTH, 33, sample.as_ptr() as isize) };
+        let padding = (measured / digits as isize).max(4);
+        let width = measured + padding;
         if self.send(SCI_GETMARGINWIDTHN, 0, 0) != width {
             self.send(SCI_SETMARGINWIDTHN, 0, width);
         }

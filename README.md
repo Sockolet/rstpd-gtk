@@ -29,7 +29,7 @@ application code or plugin code is included.
 Download the Linux x86_64 archive and its SHA-256 checksum from
 [Releases](https://github.com/Sockolet/rstpd-gtk/releases/latest), or build from
 source using the instructions below. Verify the archive with
-`sha256sum -c rstpd-1.3.1-linux-x86_64.tar.gz.sha256`, extract it, and run
+`sha256sum -c rstpd-1.4.0-linux-x86_64.tar.gz.sha256`, extract it, and run
 `./rstpd` from the extracted directory. GTK3 must be installed on the system;
 the upstream Windows ZIP is not a Linux package.
 
@@ -80,14 +80,14 @@ between platforms: filenames and locking semantics differ.
 | Line endings | CRLF, LF and CR conversion; new Linux documents default to LF |
 | Recovery | Background atomic snapshots of all tabs, including unnamed documents; restore after restart or crash |
 
-To choose documents for a split, click a pane and then choose its tab.
+Each split pane owns its tab bar and independent document selection.
 The icon toolbar keeps the same New, Open, Save, Find, Split, Compare, JSON tree
 and Document map actions. Hover for a descriptive tooltip and shortcut.
 Button names remain available to accessibility tools, and keyboard shortcuts
 and editing commands are retained. Icons come from the standard GTK icon theme
 and adapt to light/dark appearance; no icon font or browser runtime is required.
-The right-hand document's tab is marked `[R]`. Drag the divider to resize.
-**Compare** compares the active tab with the next tab (wrapping at the end).
+Drag the divider to resize. **Compare** compares the two selected split
+documents, or the active tab with the next tab when not split (wrapping at the end).
 Editing either document automatically schedules a comparison refresh.
 Old worker results are discarded if the documents changed in the meantime;
 refresh does not move your editing caret. EOL representation is ignored during
@@ -102,9 +102,23 @@ dragging nor the movement commands can cross its boundary. Pinning does not
 make a document read-only. Order and pins persist in workspace recovery.
 Double-click the empty area after the last tab to create an untitled document.
 
-The tab context menu also provides **Open in split view**, which opens the
-right-clicked document in the other pane while keeping the active document
-in place. It reuses an existing split. **Compare with current view** compares
+The tab context menu also provides **Open in split view**, which moves the
+right-clicked tab to the other pane, reusing an existing split.
+**Clone to other pane** explicitly shares the document and undo history
+between both groups. Both actions activate the destination pane. New/open and
+Ctrl+Tab use the focused group; F6 switches panes. Closing a clone removes only
+that view without prompting to discard the shared document. Closing a group's
+last tab collapses the empty group; moving its last tab leaves a new blank tab.
+The **Split** command moves the active tab to the other pane, or shows the same
+document in both panes when it is the group's only tab. Toggling an existing
+split off merges both groups without discarding documents or duplicating clones.
+Pinned-first ordering applies independently to each group. Recovery stores the
+groups, tab order, selections and focused pane. Older recovery without this
+metadata opens all documents in the left group. Invalid group indices, repeated
+tabs within one group and invalid selections are rejected as invalid recovery;
+one document can still appear in both groups.
+
+**Compare with current view** compares
 the document active before the right-click against the clicked tab, not the
 next tab: the current document appears on the left and the clicked document
 on the right. Comparing a tab with itself is disabled. Both actions reuse
@@ -157,6 +171,9 @@ Syntax bold, italic and underline styling is retained. Explicit font-family
 and size overrides in imported language definitions still take precedence.
 The document map keeps its compact 2-point text. Old sessions without a font
 preference continue to use Monospace at 11 points.
+Line-number margins reserve at least two digits and use font-relative padding.
+They grow with the line count, font size and zoom without a fixed 52-pixel minimum.
+The separate folding controls remain available.
 
 Line operations affect complete selected lines, or the whole document when
 there is no selection. Case conversion operates on selected text, including
@@ -224,6 +241,8 @@ Both kinds of definitions persist in the session.
 ```
 
 The completion API import is associated with the active file's language.
+Parameter hints keep Rust turbofish generic commas separate from call arguments.
+Comparisons such as `text == ""` do not override an annotated receiver type.
 
 ## Show symbols
 
@@ -373,13 +392,21 @@ recovery-file symlinks are rejected. Ordinary permissions and owner/group are
 preserved, **but ACLs and extended attributes are not preserved by atomic
 replacement**. Avoid saving metadata-sensitive files with this initial port.
 
-Invalid recovery files are left untouched and reported at startup. To recover
-manually, keep a copy of the file, then move it out of the session directory.
+Readable recovery that fails validation is moved, unchanged, to
+`session.invalid-<timestamp>.json` in the same directory. Startup reports its
+location and opens an empty session. Quarantine uses non-overwriting
+`renameat2(RENAME_NOREPLACE)` and flushes the directory; an earlier copy is never
+replaced. Read errors, symlinks, hard links, foreign-owned files, changed files,
+unsafe directories and unsupported rename guarantees stop startup explicitly
+rather than moving data or silently starting fresh. Keep the quarantined file
+if you need to recover its contents manually.
 On reopen, named tabs use their recovery snapshots; a changed disk version is
 not silently substituted for the recovered text.
 
 Without a Unicode BOM, valid UTF-8 is preferred; otherwise the editor opens as
 Windows-1252 and reports the assumption (`.nfo` files use OEM 437 instead).
+If BOM-less bytes look like UTF-16, the status bar reports the hint without
+changing the selected UTF-8/Windows-1252 decoding. Saving as UTF-16 writes a BOM.
 Use **Encoding > Reopen** to explicitly
 reinterpret bytes. Reopen discards current edits only after confirmation.
 Conversions that cannot represent every character are rejected.
@@ -460,6 +487,11 @@ split/map views, search and replacement, comparison refresh, JSON navigation,
 encoding/EOL, imported definitions, completion and recovery. Native editor
 tests also exercise all lexers, Unicode/NUL handling, multiple selections,
 rectangular editing, undo, and visible Markdown styles in both palettes.
+Pane regressions cover independent tab bars, focused-group navigation,
+move/clone/close behavior, shared undo, split-aware comparison, persisted layout,
+legacy recovery, quarantine startup and explicit reopening of BOM-less UTF-16.
+`tests/parity_contract.rs` runs the same portable completion, encoding-hint,
+pane-layout and recovery-quarantine contracts as the Windows sibling.
 They also cover persisted symbol preferences, Unicode/selection character
 counts, native search-control affordances/layout, read-only result navigation,
 cancellation and stale/closed-document behavior. Manually dispatched CI runs

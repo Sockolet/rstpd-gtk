@@ -128,7 +128,8 @@ fn exercise_editor_font_selection(app: &mut App) {
     text(app, "font sample\nsecond line\n");
     app.editor().replace(0..0, "x").unwrap();
     app.editor().select(3..8);
-    app.command(SPLIT).unwrap();
+    app.command(TAB_CLONE).unwrap();
+    app.focus_pane(0);
     app.command(MAP).unwrap();
     app.editors[0].send(SCI_SETZOOM, 4, 0);
     app.editors[1].send(SCI_SETZOOM, 3, 0);
@@ -234,7 +235,8 @@ fn exercise_symbols_results_and_counts(app: &mut App) {
     assert!(app.show_symbols.all_characters());
     app.command(SYMBOL_INDENT).unwrap();
     app.command(SYMBOL_WRAP).unwrap();
-    app.command(SPLIT).unwrap();
+    app.command(TAB_CLONE).unwrap();
+    app.focus_pane(0);
     pump(app);
     for theme in [THEME_LIGHT, THEME_DARK] {
         app.command(theme).unwrap();
@@ -526,60 +528,70 @@ fn exercise_tab_order(app: &mut App) {
     app.new_document().unwrap();
     let right = app.documents[app.index()].snapshot.id;
     pump(app);
-    app.command(SPLIT).unwrap();
-    app.focused = 1;
+    app.command(TAB_CLONE).unwrap();
+    app.focus_pane(0);
     app.switch(document_index(app, original)).unwrap();
     pump(app);
     let panes = app.pane_documents();
     app.event(Event::PinTab(edited)).unwrap();
     app.event(Event::PinTab(original)).unwrap();
-    assert_eq!(app.documents[0].snapshot.id, edited);
+    assert_eq!(app.groups[0][0], edited);
     assert_eq!(app.pane_documents(), panes);
     assert_eq!(app.documents[app.index()].snapshot.id, original);
-    let page = app
-        .tabs
-        .nth_page(Some(document_index(app, right) as u32))
+    let page = app.tabs[0]
+        .nth_page(Some(
+            app.groups[0].iter().position(|id| *id == right).unwrap() as u32,
+        ))
         .unwrap();
-    assert!(app.tabs.child_is_reorderable(&page));
-    app.tabs.reorder_child(&page, Some(0));
+    assert!(app.tabs[0].child_is_reorderable(&page));
+    app.tabs[0].reorder_child(&page, Some(0));
     pump(app);
     assert_eq!(
-        app.documents.last().unwrap().snapshot.id,
+        *app.groups[0].last().unwrap(),
         right,
         "Unpinned tabs cannot cross the pinned partition"
     );
     assert_eq!(app.pane_documents(), panes);
-    app.event(Event::MoveTab(original, 0)).unwrap();
+    app.event(Event::MoveTab(0, original, 0)).unwrap();
     app.event(Event::PinTab(edited)).unwrap();
-    app.event(Event::StepTab(original, false)).unwrap();
-    assert_eq!(app.documents[0].snapshot.id, original);
+    app.event(Event::StepTab(0, original, false)).unwrap();
+    assert_eq!(app.groups[0][0], original);
     let edited_index = document_index(app, edited);
     app.scratch.attach(&app.documents[edited_index].handle);
     assert_eq!(app.scratch.text().unwrap(), "retained undo");
     assert_ne!(app.scratch.send(SCI_CANUNDO, 0, 0), 0);
     assert!(app.documents[edited_index].snapshot.dirty);
-    assert!(app.snapshot().unwrap().documents[0].pinned);
+    assert!(app.snapshot().unwrap().documents[document_index(app, original)].pinned);
+    app.command(SPLIT).unwrap();
 
-    let strip = app.tabs.parent().unwrap().downcast::<gtk::Box>().unwrap();
+    let strip = app.tabs[0]
+        .parent()
+        .unwrap()
+        .downcast::<gtk::Box>()
+        .unwrap();
     let empty_strip = strip.children()[1].clone();
     assert!(empty_strip.tooltip_text().unwrap().contains("Double-click"));
     app.window.resize(1280, 840);
     wait_for(app, |app| {
-        let last = app.tabs.nth_page(Some(app.tabs.n_pages() - 1)).unwrap();
-        app.tabs.allocated_width() == app.tab_width.get()
-            && app.tabs.tab_label(&last).unwrap().allocated_width() > 100
-            && app.tabs.tab_label(&last).unwrap().is_drawable()
+        let last = app.tabs[0]
+            .nth_page(Some(app.tabs[0].n_pages() - 1))
+            .unwrap();
+        app.tabs[0].allocated_width() == app.tab_width[0].get()
+            && app.tabs[0].tab_label(&last).unwrap().allocated_width() > 100
+            && app.tabs[0].tab_label(&last).unwrap().is_drawable()
             && empty_strip.allocated_width() > 48
     });
-    let (tab_x, _) = app.tabs.translate_coordinates(&strip, 0, 0).unwrap();
+    let (tab_x, _) = app.tabs[0].translate_coordinates(&strip, 0, 0).unwrap();
     let (blank_x, blank_y) = empty_strip.translate_coordinates(&strip, 0, 0).unwrap();
     assert_eq!(
         blank_x,
-        tab_x + app.tabs.allocated_width(),
+        tab_x + app.tabs[0].allocated_width(),
         "The expandable blank strip must start immediately after the full native tab header"
     );
-    let last = app.tabs.nth_page(Some(app.tabs.n_pages() - 1)).unwrap();
-    let last_label = app.tabs.tab_label(&last).unwrap();
+    let last = app.tabs[0]
+        .nth_page(Some(app.tabs[0].n_pages() - 1))
+        .unwrap();
+    let last_label = app.tabs[0].tab_label(&last).unwrap();
     let (last_x, _) = last_label.translate_coordinates(&strip, 0, 0).unwrap();
     assert!(blank_x >= last_x + last_label.allocated_width());
     let boundary = (blank_x + 1, blank_y + empty_strip.allocated_height() / 2);
@@ -604,8 +616,8 @@ fn exercise_tab_order(app: &mut App) {
         3,
         position
     ));
-    let page = app.tabs.nth_page(Some(0)).unwrap();
-    let label = app.tabs.tab_label(&page).unwrap();
+    let page = app.tabs[0].nth_page(Some(0)).unwrap();
+    let label = app.tabs[0].tab_label(&page).unwrap();
     press(&label, gdk::EventType::DoubleButtonPress, 1);
     pump(app);
     assert_eq!(app.documents.len(), count);
@@ -618,7 +630,6 @@ fn exercise_tab_order(app: &mut App) {
     pump(app);
     assert_eq!(app.documents.len(), count + 1);
     assert!(!app.documents.last().unwrap().snapshot.pinned);
-    app.command(SPLIT).unwrap();
     while let Some(index) = app
         .documents
         .iter()
@@ -632,11 +643,17 @@ fn exercise_tab_order(app: &mut App) {
 
 fn tab_context_menu(app: &App, id: u64) -> gtk::Menu {
     let current = app.documents[app.index()].snapshot.id;
-    let page = app
-        .tabs
-        .nth_page(Some(document_index(app, id) as u32))
+    let pane = if app.groups[app.focused].contains(&id) {
+        app.focused
+    } else {
+        1 - app.focused
+    };
+    let position = app.groups[pane]
+        .iter()
+        .position(|entry| *entry == id)
         .unwrap();
-    let tab = app.tabs.tab_label(&page).unwrap();
+    let page = app.tabs[pane].nth_page(Some(position as u32)).unwrap();
+    let tab = app.tabs[pane].tab_label(&page).unwrap();
     assert!(press(&tab, gdk::EventType::ButtonPress, 3));
     assert_eq!(
         app.documents[app.index()].snapshot.id,
@@ -687,18 +704,21 @@ fn exercise_tab_context_actions(app: &mut App) {
     let count = app.documents.len();
     activate_tab_context(app, target, "Open in split view");
     assert_eq!(app.pane_documents(), (original, Some(target)));
-    assert_eq!(app.focused, 0);
-    assert_eq!(app.editor().selection(), selection);
+    assert_eq!(app.focused, 1);
+    assert_eq!(app.editors[0].selection(), selection);
     assert_eq!(app.editors[1].text().unwrap(), "edited target document\n");
     assert_ne!(app.editors[1].send(SCI_CANUNDO, 0, 0), 0);
     assert!(app.documents[document_index(app, target)].snapshot.dirty);
     assert!(!app.comparing);
 
-    app.event(Event::OtherPane).unwrap();
-    pump(app);
     activate_tab_context(app, unrelated, "Open in split view");
-    assert_eq!(app.pane_documents(), (unrelated, Some(target)));
-    assert_eq!(app.focused, 1, "The active right pane must stay active");
+    assert_eq!(app.pane_documents(), (original, Some(unrelated)));
+    assert_eq!(
+        app.focused, 1,
+        "Moving a tab activates its destination pane"
+    );
+    app.event(Event::Tab(1, target)).unwrap();
+    pump(app);
     activate_tab_context(app, original, "Compare with current view");
     wait_for(app, |app| {
         app.compare_rx.is_none() && app.compare_due.is_none()
@@ -731,10 +751,10 @@ fn exercise_tab_context_actions(app: &mut App) {
         "A rejected self-comparison must preserve the current pair"
     );
     assert!(app.event(Event::CompareTabs(target, u64::MAX)).is_err());
-    assert!(app.event(Event::SplitTab(u64::MAX)).is_err());
+    assert!(app.event(Event::SplitTab(0, u64::MAX)).is_err());
     activate_tab_context(app, unrelated, "Open in split view");
     assert!(!app.comparing);
-    assert_eq!(app.pane_documents(), (target, Some(unrelated)));
+    assert_eq!(app.pane_documents(), (unrelated, Some(original)));
     assert!(app.compare_pair.is_none());
     for editor in &app.editors {
         assert_eq!(
@@ -804,7 +824,8 @@ fn exercise_external_reload(app: &mut App, directory: &Path) {
     fs::write(&path, &initial).unwrap();
     app.open_path(&path, None).unwrap();
     let id = app.documents[app.index()].snapshot.id;
-    app.command(SPLIT).unwrap();
+    app.command(TAB_CLONE).unwrap();
+    app.focus_pane(0);
     app.editors[0].select(90..99);
     app.editors[0].send(SCI_ADDSELECTION, 117, 108);
     app.editors[1].select(180..189);
@@ -1080,7 +1101,8 @@ fn exercise_compare_modes(app: &mut App, directory: &Path) {
     app.new_document().unwrap();
     let left = app.documents[app.index()].snapshot.id;
     text(app, "prefix left\nsame\nold value\nend\n");
-    app.command(SPLIT).unwrap();
+    app.command(TAB_CLONE).unwrap();
+    app.focus_pane(0);
     app.editors[0].select(13..17);
     app.editors[1].select(13..17);
     assert!(
@@ -1340,7 +1362,7 @@ fn exercise_compare_modes(app: &mut App, directory: &Path) {
     assert_eq!(fs::read_to_string(&path).unwrap(), texts[0]);
     let pair = app.compare_pair;
     app.event(Event::PinTab(left)).unwrap();
-    app.event(Event::MoveTab(left, 0)).unwrap();
+    app.event(Event::MoveTab(0, left, 0)).unwrap();
     assert_eq!(app.compare_pair, pair);
     assert_eq!(app.documents[app.primary].snapshot.id, left);
     app.editors[0].replace(0..0, "more ").unwrap();
@@ -1360,6 +1382,224 @@ fn exercise_compare_modes(app: &mut App, directory: &Path) {
     }
     app.switch(document_index(app, original)).unwrap();
     pump(app);
+}
+
+fn exercise_pane_group_parity_and_recovery(directory: &Path) {
+    let state = directory.join("pane-parity-state");
+    let mut app = App::new(&state).unwrap();
+    app.new_document().unwrap();
+    app.window.show_all();
+    app.layout();
+    pump(&mut app);
+    let original = app.documents[app.index()].snapshot.id;
+    text(&mut app, "left shared\n");
+    app.new_document().unwrap();
+    let right = app.documents[app.index()].snapshot.id;
+    text(&mut app, "right independent\n");
+    app.new_document().unwrap();
+    let unrelated = app.documents[app.index()].snapshot.id;
+    text(&mut app, "not the comparison target\n");
+    app.switch(document_index(&app, original)).unwrap();
+    app.event(Event::SplitTab(0, right)).unwrap();
+    pump(&mut app);
+    assert_eq!(app.groups, [vec![original, unrelated], vec![right]]);
+    assert_eq!(app.focused, 1);
+    assert_eq!(app.tabs[0].n_pages(), 2);
+    assert_eq!(app.tabs[1].n_pages(), 1);
+    assert!(app.pane_boxes[1].is_visible());
+    app.editor().replace(0..0, "edited ").unwrap();
+    pump(&mut app);
+    assert_eq!(app.editors[0].text().unwrap(), "left shared\n");
+
+    let count = app.documents.len();
+    app.event(Event::NewInPane(1)).unwrap();
+    assert_eq!(app.groups[0], vec![original, unrelated]);
+    assert_eq!(app.groups[1].len(), 2);
+    app.close_document().unwrap();
+    pump(&mut app);
+    assert_eq!(app.documents.len(), count);
+    assert_eq!(app.groups[1], vec![right]);
+    app.event(Event::NextTab(false)).unwrap();
+    assert_eq!(app.documents[app.index()].snapshot.id, right);
+    app.event(Event::OtherPane).unwrap();
+    app.event(Event::NextTab(false)).unwrap();
+    assert_eq!(app.documents[app.index()].snapshot.id, unrelated);
+    assert_eq!(app.documents[app.secondary.unwrap()].snapshot.id, right);
+    app.event(Event::NextTab(true)).unwrap();
+    app.command(COMPARE).unwrap();
+    wait_for_comparison(&mut app);
+    assert_eq!(
+        app.compare_pair,
+        Some([original, right]),
+        "Compare uses the selected split pair, not the next left tab"
+    );
+    app.command(COMPARE_CLEAR).unwrap();
+
+    app.focus_pane(0);
+    app.command(TAB_CLONE).unwrap();
+    pump(&mut app);
+    assert_eq!(app.documents.len(), count);
+    assert!(app.groups[0].contains(&original) && app.groups[1].contains(&original));
+    assert_eq!(app.focused, 1);
+    app.editors[0].select(1..3);
+    app.editors[1].select(0..2);
+    assert_eq!(app.editors[0].selection(), 1..3);
+    assert_eq!(app.editors[1].selection(), 0..2);
+    app.editor().replace(0..0, "shared ").unwrap();
+    assert_eq!(
+        app.editors[0].text().unwrap(),
+        app.editors[1].text().unwrap()
+    );
+    app.editor().send(SCI_UNDO, 0, 0);
+    assert_eq!(app.editors[0].text().unwrap(), "left shared\n");
+    assert_eq!(app.editors[1].text().unwrap(), "left shared\n");
+    app.editor().replace(0..0, "unsaved ").unwrap();
+    pump(&mut app);
+    assert!(app.document_dirty(document_index(&app, original)));
+    app.close_document().unwrap();
+    pump(&mut app);
+    assert_eq!(
+        app.documents.len(),
+        count,
+        "Closing a dirty clone removes only that view, without a save dialog"
+    );
+    assert!(!app.groups[1].contains(&original));
+    assert_eq!(app.editors[0].text().unwrap(), "unsaved left shared\n");
+    app.event(Event::SplitTab(1, right)).unwrap();
+    pump(&mut app);
+    assert!(app.groups[0].contains(&right));
+    assert_eq!(
+        app.groups[1].len(),
+        1,
+        "Moving the source group's last tab leaves a blank tab"
+    );
+    let blank = app.groups[1][0];
+    app.scratch
+        .attach(&app.documents[document_index(&app, blank)].handle);
+    assert_eq!(app.scratch.text().unwrap(), "");
+    app.pin_tab(unrelated);
+    app.event(Event::MoveTab(0, right, 0)).unwrap();
+    assert_eq!(
+        app.groups[0][0], unrelated,
+        "Dragging cannot cross the pinned boundary"
+    );
+
+    app.switch(document_index(&app, original)).unwrap();
+    app.command(TAB_CLONE).unwrap();
+    app.focus_pane(0);
+    app.switch(document_index(&app, unrelated)).unwrap();
+    app.focus_pane(1);
+    app.editor().focus();
+    pump(&mut app);
+    let saved = app.snapshot().unwrap();
+    assert_eq!(saved.focused_pane, 1);
+    assert_ne!(saved.pane_selected[0], saved.pane_selected[1]);
+    assert_eq!(saved.documents.len(), count + 1);
+    app.close().unwrap();
+    drop(app);
+    EVENTS.with(|events| events.borrow_mut().clear());
+
+    let mut app = App::new(&state).unwrap();
+    app.window.show_all();
+    app.layout();
+    app.editor().focus();
+    pump(&mut app);
+    let restored = app.snapshot().unwrap();
+    assert_eq!(restored.pane_documents, saved.pane_documents);
+    assert_eq!(restored.pane_selected, saved.pane_selected);
+    assert_eq!(restored.focused_pane, saved.focused_pane);
+    assert_eq!(app.editor().text().unwrap(), "unsaved left shared\n");
+    assert_eq!(
+        app.tabs[0].n_pages() as usize,
+        saved.pane_documents[0].len()
+    );
+    assert_eq!(
+        app.tabs[1].n_pages() as usize,
+        saved.pane_documents[1].len()
+    );
+    app.close_document().unwrap();
+    assert_eq!(app.documents.len(), saved.documents.len());
+    app.close_document().unwrap();
+    pump(&mut app);
+    assert!(app.secondary.is_none());
+    assert!(!app.pane_boxes[1].is_visible());
+    assert_eq!(app.focused, 0);
+
+    let bomless = directory.join("bomless-utf16.txt");
+    fs::write(&bomless, b"a\0b\0c\0").unwrap();
+    app.open_path(&bomless, None).unwrap();
+    pump(&mut app);
+    assert_eq!(app.documents[app.index()].snapshot.encoding, Encoding::Utf8);
+    assert_eq!(app.editor().text().unwrap(), "a\0b\0c\0");
+    assert!(
+        app.status
+            .text()
+            .contains(&format!("bytes look like {}", Encoding::Utf16Le.label()))
+    );
+    let encoding = core::encoding_options()
+        .iter()
+        .position(|encoding| *encoding == Encoding::Utf16Le)
+        .unwrap();
+    app.command(REOPEN_BASE + encoding).unwrap();
+    assert_eq!(app.editor().text().unwrap(), "abc");
+    assert_eq!(fs::read(&bomless).unwrap(), b"a\0b\0c\0");
+    app.close().unwrap();
+    drop(app);
+    EVENTS.with(|events| events.borrow_mut().clear());
+
+    let legacy_state = directory.join("pane-legacy-state");
+    fs::create_dir(&legacy_state).unwrap();
+    let mut legacy = serde_json::to_value(&saved).unwrap();
+    for field in ["pane_documents", "pane_selected", "focused_pane"] {
+        legacy.as_object_mut().unwrap().remove(field);
+    }
+    legacy["version"] = 1.into();
+    fs::write(
+        legacy_state.join("session.json"),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+    let mut app = App::new(&legacy_state).unwrap();
+    app.window.show_all();
+    app.layout();
+    pump(&mut app);
+    assert_eq!(app.documents.len(), saved.documents.len());
+    assert_eq!(app.groups[0].len(), saved.documents.len());
+    assert!(app.groups[1].is_empty());
+    assert!(app.secondary.is_none());
+    assert_eq!(app.focused, 0);
+    app.close().unwrap();
+    drop(app);
+    EVENTS.with(|events| events.borrow_mut().clear());
+
+    let invalid_state = directory.join("quarantine-startup-state");
+    fs::create_dir(&invalid_state).unwrap();
+    let invalid_bytes = b"invalid recovery \xff that must be preserved unchanged";
+    fs::write(invalid_state.join("session.json"), invalid_bytes).unwrap();
+    let mut app = App::new(&invalid_state).unwrap();
+    assert!(app.documents.is_empty());
+    assert!(
+        app.startup_warning
+            .as_ref()
+            .unwrap()
+            .contains("moved, unchanged")
+    );
+    assert!(fs::read_dir(&invalid_state).unwrap().any(|entry| {
+        let entry = entry.unwrap();
+        entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("session.invalid-")
+            && fs::read(entry.path()).unwrap() == invalid_bytes
+    }));
+    app.new_document().unwrap();
+    app.window.show_all();
+    app.layout();
+    pump(&mut app);
+    assert_eq!(app.editor().text().unwrap(), "");
+    app.close().unwrap();
+    drop(app);
+    EVENTS.with(|events| events.borrow_mut().clear());
 }
 
 #[test]
@@ -1397,9 +1637,8 @@ fn gtk_workflows_preserve_editing_features_and_recovery() {
     assert!(!app.tree_scroll.is_visible());
     assert!(!app.map_box.is_visible());
     assert!(!app.editors[1].widget().is_visible());
-    let page = app.tabs.nth_page(Some(0)).unwrap();
-    let tab = app
-        .tabs
+    let page = app.tabs[0].nth_page(Some(0)).unwrap();
+    let tab = app.tabs[0]
         .tab_label(&page)
         .unwrap()
         .downcast::<gtk::EventBox>()
@@ -1437,7 +1676,7 @@ fn gtk_workflows_preserve_editing_features_and_recovery() {
         2,
         "Menu activation must reach the command queue"
     );
-    app.tabs.set_current_page(Some(0));
+    app.tabs[0].set_current_page(Some(0));
     pump(&mut app);
     assert_eq!(
         app.index(),
@@ -1472,6 +1711,7 @@ fn gtk_workflows_preserve_editing_features_and_recovery() {
 
     text(&mut app, "one\ntwo\n");
     app.command(SPLIT).unwrap();
+    app.focus_pane(0);
     pump(&mut app);
     assert!(app.editors[1].widget().is_visible());
     app.editors[0].send(SCI_SETSELECTION, 3, 0);
@@ -1899,4 +2139,5 @@ fn gtk_workflows_preserve_editing_features_and_recovery() {
     app.close().unwrap();
     drop(app);
     EVENTS.with(|events| events.borrow_mut().clear());
+    exercise_pane_group_parity_and_recovery(&directory);
 }

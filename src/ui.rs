@@ -102,6 +102,8 @@ const FIND_FOLDER: usize = 1181;
 const TAB_PIN: usize = 1182;
 const TAB_LEFT: usize = 1183;
 const TAB_RIGHT: usize = 1184;
+const TAB_SPLIT: usize = 1185;
+const TAB_CLONE: usize = 1186;
 const SYMBOL_SPACE: usize = 1300;
 const SYMBOL_EOL: usize = 1301;
 const SYMBOL_NONPRINTING: usize = 1302;
@@ -195,13 +197,15 @@ enum Event {
     Command(usize),
     Close,
     Theme,
-    Tab(u64),
-    CloseTab(u64),
-    MoveTab(u64, usize),
+    NewInPane(usize),
+    Tab(usize, u64),
+    CloseTab(usize, u64),
+    MoveTab(usize, u64, usize),
     PinTab(u64),
-    SplitTab(u64),
+    SplitTab(usize, u64),
+    CloneTab(usize, u64),
     CompareTabs(u64, u64),
-    StepTab(u64, bool),
+    StepTab(usize, u64, bool),
     NextTab(bool),
     OtherPane,
     Escape,
@@ -233,9 +237,9 @@ fn queue(event: Event) {
     });
 }
 
-fn empty_tab_strip_press(kind: gdk::EventType, button: u32) -> glib::Propagation {
+fn empty_tab_strip_press(pane: usize, kind: gdk::EventType, button: u32) -> glib::Propagation {
     if kind == gdk::EventType::DoubleButtonPress && button == 1 {
-        queue(Event::Command(NEW));
+        queue(Event::NewInPane(pane));
         glib::Propagation::Stop
     } else {
         glib::Propagation::Proceed
@@ -599,6 +603,16 @@ struct Document {
     last_edit: Instant,
 }
 
+fn document_position(documents: &[Document], id: u64) -> Option<usize> {
+    documents.iter().position(|doc| doc.snapshot.id == id)
+}
+
+fn pinned_first(documents: &[Document], group: &mut [u64]) {
+    group.sort_by_key(|id| {
+        !document_position(documents, *id).is_some_and(|index| documents[index].snapshot.pinned)
+    });
+}
+
 struct CompareResult {
     left: u64,
     right: u64,
@@ -623,8 +637,9 @@ struct HighlightResult {
 struct App {
     window: gtk::Window,
     menu: gtk::MenuBar,
-    tabs: gtk::Notebook,
-    tab_width: Rc<Cell<i32>>,
+    tabs: [gtk::Notebook; 2],
+    tab_width: [Rc<Cell<i32>>; 2],
+    groups: [Vec<u64>; 2],
     status: gtk::Label,
     search: SearchBar,
     content: gtk::Paned,
@@ -635,6 +650,7 @@ struct App {
     map_box: gtk::EventBox,
     editors: [Editor; 2],
     pane_frames: [gtk::Overlay; 2],
+    pane_boxes: [gtk::Box; 2],
     pane_ids: [Rc<Cell<u64>>; 2],
     scratch: Editor,
     map: Editor,
@@ -688,6 +704,7 @@ struct App {
     last_autosave: Instant,
     recovery_error: Option<String>,
     note: String,
+    startup_warning: Option<String>,
     last_zero_match: Option<(u64, usize, String)>,
     exiting: bool,
     _lock: session::SessionLock,
@@ -702,7 +719,7 @@ impl App {
 
     fn new_with_lock(directory: &Path, lock: session::SessionLock) -> Result<Self> {
         let recovery_path = directory.join("session.json");
-        let session = session::load(&recovery_path)?;
+        let (session, startup_warning) = session::load_or_quarantine(&recovery_path)?;
         let settings = gtk::Settings::default().ok_or("GTK settings are unavailable.")?;
         let fallback_dark = settings.property::<bool>("gtk-application-prefer-dark-theme")
             || settings
@@ -736,59 +753,63 @@ impl App {
             false,
             0,
         );
-        let tabs = gtk::Notebook::new();
-        tabs.set_scrollable(true);
-        tabs.set_show_border(false);
-        tabs.set_can_focus(false);
-        tabs.set_hexpand(false);
-        tabs.connect_switch_page(move |_, page, _| {
-            if !TABS_UPDATING.with(Cell::get)
-                && let Ok(id) = page.widget_name().parse::<u64>()
-            {
-                queue(Event::Tab(id));
-            }
-        });
-        tabs.connect_page_reordered(|_, page, position| {
-            if !TABS_UPDATING.with(Cell::get)
-                && let Ok(id) = page.widget_name().parse::<u64>()
-            {
-                queue(Event::MoveTab(id, position as usize));
-            }
-        });
-        let empty_strip = gtk::EventBox::new();
-        empty_strip.set_visible_window(false);
-        empty_strip.set_size_request(48, -1);
-        empty_strip.set_tooltip_text(Some(
-            "Double-click this empty tab-strip area to create a new document",
-        ));
-        empty_strip.add_events(gdk::EventMask::BUTTON_PRESS_MASK);
-        empty_strip.connect_button_press_event(|_, event| {
-            empty_tab_strip_press(event.event_type(), event.button())
-        });
-        let tab_strip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        tab_strip.pack_start(&tabs, false, false, 0);
-        tab_strip.pack_start(&empty_strip, true, true, 0);
-        let tab_width = Rc::new(Cell::new(1));
-        let width = tab_width.clone();
-        let notebook = tabs.clone();
-        let blank = empty_strip.clone();
-        tab_strip.connect_size_allocate(move |_, allocation| {
-            // Scrollable notebooks request only one tab; retain full headers when they fit.
-            let width = width.get().min((allocation.width() - 48).max(1));
-            notebook.size_allocate(&gtk::Allocation::new(
-                allocation.x(),
-                allocation.y(),
-                width,
-                allocation.height(),
+        let tabs = [gtk::Notebook::new(), gtk::Notebook::new()];
+        let tab_strips = [
+            gtk::Box::new(gtk::Orientation::Horizontal, 0),
+            gtk::Box::new(gtk::Orientation::Horizontal, 0),
+        ];
+        let tab_width = [Rc::new(Cell::new(1)), Rc::new(Cell::new(1))];
+        for (pane, notebook) in tabs.iter().enumerate() {
+            notebook.set_scrollable(true);
+            notebook.set_show_border(false);
+            notebook.set_can_focus(false);
+            notebook.set_hexpand(false);
+            notebook.connect_switch_page(move |_, page, _| {
+                if !TABS_UPDATING.with(Cell::get)
+                    && let Ok(id) = page.widget_name().parse::<u64>()
+                {
+                    queue(Event::Tab(pane, id));
+                }
+            });
+            notebook.connect_page_reordered(move |_, page, position| {
+                if !TABS_UPDATING.with(Cell::get)
+                    && let Ok(id) = page.widget_name().parse::<u64>()
+                {
+                    queue(Event::MoveTab(pane, id, position as usize));
+                }
+            });
+            let empty_strip = gtk::EventBox::new();
+            empty_strip.set_visible_window(false);
+            empty_strip.set_size_request(48, -1);
+            empty_strip.set_tooltip_text(Some(
+                "Double-click this empty tab-strip area to create a new document",
             ));
-            blank.size_allocate(&gtk::Allocation::new(
-                allocation.x() + width,
-                allocation.y(),
-                (allocation.width() - width).max(1),
-                allocation.height(),
-            ));
-        });
-        root.pack_start(&tab_strip, false, false, 0);
+            empty_strip.add_events(gdk::EventMask::BUTTON_PRESS_MASK);
+            empty_strip.connect_button_press_event(move |_, event| {
+                empty_tab_strip_press(pane, event.event_type(), event.button())
+            });
+            let strip = &tab_strips[pane];
+            strip.pack_start(notebook, false, false, 0);
+            strip.pack_start(&empty_strip, true, true, 0);
+            let width = tab_width[pane].clone();
+            let notebook = notebook.clone();
+            strip.connect_size_allocate(move |_, allocation| {
+                // Scrollable notebooks request one tab; retain full headers when they fit.
+                let width = width.get().min((allocation.width() - 48).max(1));
+                notebook.size_allocate(&gtk::Allocation::new(
+                    allocation.x(),
+                    allocation.y(),
+                    width,
+                    allocation.height(),
+                ));
+                empty_strip.size_allocate(&gtk::Allocation::new(
+                    allocation.x() + width,
+                    allocation.y(),
+                    (allocation.width() - width).max(1),
+                    allocation.height(),
+                ));
+            });
+        }
         let search = SearchBar::new();
         root.pack_start(&search.container, false, false, 0);
         let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -852,6 +873,10 @@ impl App {
         }
         let split = gtk::Paned::new(gtk::Orientation::Horizontal);
         let pane_frames = [gtk::Overlay::new(), gtk::Overlay::new()];
+        let pane_boxes = [
+            gtk::Box::new(gtk::Orientation::Vertical, 0),
+            gtk::Box::new(gtk::Orientation::Vertical, 0),
+        ];
         for (pane, frame) in pane_frames.iter().enumerate() {
             let background = gtk::EventBox::new();
             background.set_size_request(80, 60);
@@ -868,6 +893,8 @@ impl App {
             });
             frame.add(&background);
             frame.add_overlay(editors[pane].widget());
+            pane_boxes[pane].pack_start(&tab_strips[pane], false, false, 0);
+            pane_boxes[pane].pack_start(frame, true, true, 0);
             // Leading comparison rows must not increase the window's minimum height.
             frame.connect_get_child_position(|frame, child| {
                 let height = frame.allocated_height().max(1);
@@ -882,8 +909,8 @@ impl App {
                 ))
             });
         }
-        split.pack1(&pane_frames[0], true, false);
-        split.pack2(&pane_frames[1], true, false);
+        split.pack1(&pane_boxes[0], true, false);
+        split.pack2(&pane_boxes[1], true, false);
         body.pack_start(&split, true, true, 0);
         let scratch = Editor::new()?;
         let map = Editor::new()?;
@@ -963,6 +990,7 @@ impl App {
             menu,
             tabs,
             tab_width,
+            groups: Default::default(),
             status,
             search,
             content,
@@ -973,6 +1001,7 @@ impl App {
             map_box,
             editors,
             pane_frames,
+            pane_boxes,
             pane_ids,
             scratch,
             map,
@@ -1026,6 +1055,7 @@ impl App {
             last_autosave: Instant::now(),
             recovery_error: None,
             note: String::new(),
+            startup_warning,
             last_zero_match: None,
             exiting: false,
             _lock: lock,
@@ -1036,16 +1066,43 @@ impl App {
             app.add_document(snapshot)?;
         }
         if !app.documents.is_empty() {
+            let original_ids: Vec<_> = app.documents.iter().map(|doc| doc.snapshot.id).collect();
             let active = app.documents[session.active.min(app.documents.len() - 1)]
                 .snapshot
                 .id;
-            app.partition_tabs();
-            let index = app
-                .documents
-                .iter()
-                .position(|doc| doc.snapshot.id == active)
-                .unwrap();
-            app.switch(index)?;
+            if session.pane_documents.iter().any(|group| !group.is_empty()) {
+                app.groups = session.pane_documents.map(|group| {
+                    group
+                        .into_iter()
+                        .filter_map(|index| original_ids.get(index).copied())
+                        .collect()
+                });
+                for id in original_ids.iter().copied() {
+                    if !app.groups.iter().any(|group| group.contains(&id)) {
+                        app.groups[0].push(id);
+                    }
+                }
+                app.primary = original_ids
+                    .get(session.pane_selected[0])
+                    .and_then(|id| document_position(&app.documents, *id))
+                    .unwrap_or(0);
+                app.secondary = original_ids
+                    .get(session.pane_selected[1])
+                    .and_then(|id| document_position(&app.documents, *id));
+                app.focused = session.focused_pane;
+            } else {
+                app.primary = document_position(&app.documents, active).unwrap_or(0);
+                app.secondary = None;
+                app.focused = 0;
+            }
+            app.normalize_groups();
+            app.refresh_views()?;
+            app.update_tabs();
+            app.editor()
+                .send(SCI_GOTOPOS, app.documents[app.index()].snapshot.caret, 0);
+        }
+        if let Some(warning) = app.startup_warning.clone() {
+            app.note(warning);
         }
         Ok(app)
     }
@@ -1063,6 +1120,7 @@ impl App {
     fn effective_wrap(&self) -> bool {
         self.wrap && !(self.comparing && self.compare_options.align)
     }
+    #[cfg(test)]
     fn pane_documents(&self) -> (u64, Option<u64>) {
         (
             self.documents[self.primary].snapshot.id,
@@ -1070,37 +1128,27 @@ impl App {
                 .map(|index| self.documents[index].snapshot.id),
         )
     }
-    fn remap_panes(&mut self, ids: (u64, Option<u64>)) {
-        self.primary = self
-            .documents
-            .iter()
-            .position(|doc| doc.snapshot.id == ids.0)
-            .unwrap();
-        self.secondary = ids
-            .1
-            .and_then(|id| self.documents.iter().position(|doc| doc.snapshot.id == id));
-    }
     fn partition_tabs(&mut self) {
-        let ids = self.pane_documents();
-        self.documents.sort_by_key(|doc| !doc.snapshot.pinned);
-        self.remap_panes(ids);
+        for group in &mut self.groups {
+            pinned_first(&self.documents, group);
+        }
         self.update_tabs();
         self.touch();
     }
-    fn move_tab(&mut self, id: u64, requested: usize) -> Result<()> {
-        let Some(from) = self.documents.iter().position(|doc| doc.snapshot.id == id) else {
+    fn move_tab(&mut self, pane: usize, id: u64, requested: usize) -> Result<()> {
+        let Some(from) = self.groups[pane].iter().position(|entry| *entry == id) else {
             return Ok(());
         };
-        let pinned: Vec<_> = self
-            .documents
+        let pinned: Vec<_> = self.groups[pane]
             .iter()
-            .map(|doc| doc.snapshot.pinned)
+            .map(|id| {
+                document_position(&self.documents, *id)
+                    .is_some_and(|index| self.documents[index].snapshot.pinned)
+            })
             .collect();
         let target = crate::tabs::move_target(&pinned, from, requested.min(pinned.len() - 1))?;
-        let ids = self.pane_documents();
-        let document = self.documents.remove(from);
-        self.documents.insert(target, document);
-        self.remap_panes(ids);
+        let id = self.groups[pane].remove(from);
+        self.groups[pane].insert(target, id);
         self.update_tabs();
         self.touch();
         Ok(())
@@ -1134,6 +1182,7 @@ impl App {
             .widget()
             .set_visible(self.secondary.is_some());
         self.pane_frames[1].set_visible(self.secondary.is_some());
+        self.pane_boxes[1].set_visible(self.secondary.is_some());
         self.results.container.set_visible(self.results.visible);
     }
 
@@ -1154,6 +1203,8 @@ impl App {
                     (TAB_PIN, "Pin / unpin tab"),
                     (TAB_LEFT, "Move tab left    Ctrl+Shift+PageUp"),
                     (TAB_RIGHT, "Move tab right    Ctrl+Shift+PageDown"),
+                    (TAB_SPLIT, "Open in split view"),
+                    (TAB_CLONE, "Clone to other pane"),
                     (0, ""),
                     (EXIT, "Quit (keep session)"),
                 ],
@@ -1502,6 +1553,7 @@ impl App {
         self.next_id += 1;
         snapshot.text.clear();
         let dirty = snapshot.dirty;
+        self.groups[self.focused].push(snapshot.id);
         self.documents.push(Document {
             handle,
             snapshot,
@@ -1512,12 +1564,19 @@ impl App {
             styled_revision: None,
             last_edit: Instant::now(),
         });
+        if self.documents.len() == 1 {
+            self.refresh_views()?;
+        }
+        self.partition_tabs();
         self.switch(self.documents.len() - 1)?;
         self.touch();
         Ok(())
     }
 
     fn new_document(&mut self) -> Result<()> {
+        if self.comparing {
+            self.clear_compare();
+        }
         self.add_document(DocumentSnapshot {
             id: 0,
             title: format!("Untitled {}", self.next_id),
@@ -1536,6 +1595,18 @@ impl App {
     fn switch(&mut self, index: usize) -> Result<()> {
         if index >= self.documents.len() {
             return Err("This tab is no longer open.".into());
+        }
+        let id = self.documents[index].snapshot.id;
+        if !self.groups[self.focused].contains(&id) {
+            let other = 1 - self.focused;
+            if !self.groups[other].contains(&id) {
+                return Err("This document has no open view.".into());
+            }
+            self.focus_pane(other);
+        }
+        if self.index() == index && self.pane_ids[self.focused].get() == id {
+            self.editor().focus();
+            return Ok(());
         }
         if self.comparing && index != self.index() {
             self.clear_compare();
@@ -1557,6 +1628,59 @@ impl App {
             self.schedule_json();
         }
         Ok(())
+    }
+
+    fn focus_pane(&mut self, pane: usize) {
+        if pane > 1 || (pane == 1 && self.secondary.is_none()) {
+            return;
+        }
+        if self.focused != pane {
+            self.focused = pane;
+            self.configure_map();
+            self.update_tabs();
+            self.update_status();
+            self.touch();
+            if self.tree_visible {
+                self.schedule_json();
+            }
+        }
+        self.editor().focus();
+    }
+
+    fn normalize_groups(&mut self) {
+        for group in &mut self.groups {
+            let mut seen = HashSet::new();
+            group
+                .retain(|id| seen.insert(*id) && document_position(&self.documents, *id).is_some());
+            pinned_first(&self.documents, group);
+        }
+        if self.groups[0].is_empty() {
+            self.groups.swap(0, 1);
+            self.primary = self.secondary.unwrap_or(0);
+            self.focused = 0;
+        }
+        let first = |pane: usize| {
+            self.groups[pane]
+                .first()
+                .and_then(|id| document_position(&self.documents, *id))
+        };
+        if !self
+            .documents
+            .get(self.primary)
+            .is_some_and(|doc| self.groups[0].contains(&doc.snapshot.id))
+        {
+            self.primary = first(0).unwrap_or(0);
+        }
+        if self.groups[1].is_empty() {
+            self.secondary = None;
+            self.focused = 0;
+        } else if !self
+            .secondary
+            .and_then(|index| self.documents.get(index))
+            .is_some_and(|doc| self.groups[1].contains(&doc.snapshot.id))
+        {
+            self.secondary = first(1);
+        }
     }
 
     fn refresh_views(&mut self) -> Result<()> {
@@ -1583,18 +1707,48 @@ impl App {
     }
 
     fn split_tab(&mut self, id: u64) -> Result<()> {
+        self.transfer_tab(id, false)
+    }
+
+    fn transfer_tab(&mut self, id: u64, clone: bool) -> Result<()> {
         let index = self
             .documents
             .iter()
             .position(|doc| doc.snapshot.id == id)
             .ok_or("This tab is no longer open.")?;
         self.clear_compare();
-        let other = 1 - self.focused;
+        let source = self.focused;
+        if !self.groups[source].contains(&id) {
+            return Err("This tab is outside the source pane.".into());
+        }
+        let other = 1 - source;
+        if !clone && self.groups[source].len() == 1 {
+            self.new_document()?;
+        }
+        if !self.groups[other].contains(&id) {
+            self.groups[other].push(id);
+            pinned_first(&self.documents, &mut self.groups[other]);
+        }
+        if !clone {
+            self.groups[source].retain(|entry| *entry != id);
+            if self.index() == index {
+                let replacement = self.groups[source]
+                    .first()
+                    .and_then(|id| document_position(&self.documents, *id))
+                    .ok_or("The source pane has no remaining tab.")?;
+                if source == 0 {
+                    self.primary = replacement;
+                } else {
+                    self.secondary = Some(replacement);
+                }
+            }
+        }
         if other == 1 {
             self.secondary = Some(index);
         } else {
             self.primary = index;
         }
+        self.focused = other;
         self.refresh_views()?;
         self.editors[other].send(SCI_GOTOPOS, self.documents[index].snapshot.caret, 0);
         self.update_tabs();
@@ -1673,87 +1827,101 @@ impl App {
 
     fn update_tabs(&self) {
         TABS_UPDATING.with(|flag| flag.set(true));
-        while self.tabs.n_pages() > 0 {
-            self.tabs.remove_page(Some(0));
+        for (pane, notebook) in self.tabs.iter().enumerate() {
+            while notebook.n_pages() > 0 {
+                notebook.remove_page(Some(0));
+            }
+            for id in &self.groups[pane] {
+                let Some(index) = document_position(&self.documents, *id) else {
+                    continue;
+                };
+                let doc = &self.documents[index];
+                let title = format!(
+                    "{}{}{}",
+                    if doc.snapshot.pinned { "[Pinned] " } else { "" },
+                    doc.snapshot.title,
+                    if doc.snapshot.dirty { " *" } else { "" }
+                );
+                let label = gtk::Label::new(Some(&title));
+                label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                label.set_width_chars(20);
+                label.set_max_width_chars(24);
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                row.pack_start(&label, true, true, 0);
+                let close =
+                    gtk::Button::from_icon_name(Some("window-close-symbolic"), gtk::IconSize::Menu);
+                close.set_relief(gtk::ReliefStyle::None);
+                close.set_can_focus(false);
+                close.set_tooltip_text(Some("Close tab"));
+                let id = doc.snapshot.id;
+                close.connect_clicked(move |_| queue(Event::CloseTab(pane, id)));
+                row.pack_end(&close, false, false, 0);
+                row.show_all();
+                let tab = gtk::EventBox::new();
+                tab.set_visible_window(false);
+                tab.add(&row);
+                let pinned = doc.snapshot.pinned;
+                let current = self.documents[self.index()].snapshot.id;
+                tab.connect_button_press_event(move |tab, event| {
+                    if event.button() != 3 {
+                        return glib::Propagation::Proceed;
+                    }
+                    let menu = gtk::Menu::new();
+                    menu.set_attach_widget(Some(tab));
+                    menu.connect_selection_done(|menu| unsafe { menu.destroy() });
+                    for (label, action) in [
+                        (if pinned { "Unpin tab" } else { "Pin tab" }, 0),
+                        ("Move tab left", 1),
+                        ("Move tab right", 2),
+                        ("Open in split view", 3),
+                        ("Compare with current view", 4),
+                        ("Clone to other pane", 5),
+                    ] {
+                        let item = gtk::MenuItem::with_label(label);
+                        item.set_sensitive(action != 4 || current != id);
+                        item.connect_activate(move |_| {
+                            queue(match action {
+                                0 => Event::PinTab(id),
+                                1 => Event::StepTab(pane, id, true),
+                                2 => Event::StepTab(pane, id, false),
+                                3 => Event::SplitTab(pane, id),
+                                4 => Event::CompareTabs(current, id),
+                                _ => Event::CloneTab(pane, id),
+                            })
+                        });
+                        menu.append(&item);
+                    }
+                    menu.show_all();
+                    menu.popup_at_pointer(Some(event));
+                    glib::Propagation::Stop
+                });
+                tab.show_all();
+                let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                page.set_widget_name(&id.to_string());
+                notebook.append_page(&page, Some(&tab));
+                notebook.set_tab_reorderable(&page, true);
+                page.show();
+            }
+            let selected = if pane == 0 {
+                Some(self.primary)
+            } else {
+                self.secondary
+            };
+            if let Some(position) = selected
+                .and_then(|index| self.documents.get(index))
+                .and_then(|doc| {
+                    self.groups[pane]
+                        .iter()
+                        .position(|id| *id == doc.snapshot.id)
+                })
+            {
+                notebook.set_current_page(Some(position as u32));
+            }
+            notebook.show();
+            notebook.set_scrollable(false);
+            self.tab_width[pane].set(notebook.preferred_width().1.max(1));
+            notebook.set_scrollable(true);
         }
-        for doc in &self.documents {
-            let title = format!(
-                "{}{}{}{}",
-                if self
-                    .secondary
-                    .is_some_and(|i| self.documents[i].snapshot.id == doc.snapshot.id)
-                {
-                    "[R] "
-                } else {
-                    ""
-                },
-                if doc.snapshot.pinned { "[Pinned] " } else { "" },
-                doc.snapshot.title,
-                if doc.snapshot.dirty { " *" } else { "" }
-            );
-            let label = gtk::Label::new(Some(&title));
-            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            label.set_width_chars(20);
-            label.set_max_width_chars(24);
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            row.pack_start(&label, true, true, 0);
-            let close =
-                gtk::Button::from_icon_name(Some("window-close-symbolic"), gtk::IconSize::Menu);
-            close.set_relief(gtk::ReliefStyle::None);
-            close.set_can_focus(false);
-            close.set_tooltip_text(Some("Close tab"));
-            let id = doc.snapshot.id;
-            close.connect_clicked(move |_| queue(Event::CloseTab(id)));
-            row.pack_end(&close, false, false, 0);
-            row.show_all();
-            let tab = gtk::EventBox::new();
-            tab.set_visible_window(false);
-            tab.add(&row);
-            let pinned = doc.snapshot.pinned;
-            let current = self.documents[self.index()].snapshot.id;
-            tab.connect_button_press_event(move |tab, event| {
-                if event.button() != 3 {
-                    return glib::Propagation::Proceed;
-                }
-                let menu = gtk::Menu::new();
-                menu.set_attach_widget(Some(tab));
-                menu.connect_selection_done(|menu| unsafe { menu.destroy() });
-                for (label, action) in [
-                    (if pinned { "Unpin tab" } else { "Pin tab" }, 0),
-                    ("Move tab left", 1),
-                    ("Move tab right", 2),
-                    ("Open in split view", 3),
-                    ("Compare with current view", 4),
-                ] {
-                    let item = gtk::MenuItem::with_label(label);
-                    item.set_sensitive(action != 4 || current != id);
-                    item.connect_activate(move |_| {
-                        queue(match action {
-                            0 => Event::PinTab(id),
-                            1 => Event::StepTab(id, true),
-                            2 => Event::StepTab(id, false),
-                            3 => Event::SplitTab(id),
-                            _ => Event::CompareTabs(current, id),
-                        })
-                    });
-                    menu.append(&item);
-                }
-                menu.show_all();
-                menu.popup_at_pointer(Some(event));
-                glib::Propagation::Stop
-            });
-            tab.show_all();
-            let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            page.set_widget_name(&id.to_string());
-            self.tabs.append_page(&page, Some(&tab));
-            self.tabs.set_tab_reorderable(&page, true);
-            page.show();
-        }
-        self.tabs.set_current_page(Some(self.index() as u32));
-        self.tabs.show();
-        self.tabs.set_scrollable(false);
-        self.tab_width.set(self.tabs.preferred_width().1.max(1));
-        self.tabs.set_scrollable(true);
         TABS_UPDATING.with(|flag| flag.set(false));
         if let Some(doc) = self.documents.get(self.index()) {
             self.window.set_title(&format!(
@@ -1822,6 +1990,19 @@ impl App {
             encoding
         };
         let (text, encoding) = core::decode(&bytes, fallback)?;
+        let utf16_note = if fallback.is_none()
+            && matches!(encoding, Encoding::Utf8 | Encoding::Legacy(_))
+        {
+            core::bomless_utf16_hint(&bytes).map(|hint| {
+                format!(
+                    "No Unicode BOM: opened as {}, but the bytes look like {}; Encoding > Reopen can change this.",
+                    encoding.label(),
+                    hint.label()
+                )
+            })
+        } else {
+            None
+        };
         let assumed = matches!(&encoding, Encoding::Legacy(name) if name == "windows-1252");
         let eol = Eol::detect(&text);
         let language = languages::detect(&path, &self.languages);
@@ -1842,7 +2023,9 @@ impl App {
             disk_hash: Some(session::fingerprint(&bytes)),
             caret: 0,
         })?;
-        if assumed {
+        if let Some(note) = utf16_note {
+            self.note(note);
+        } else if assumed {
             self.note("No Unicode BOM / valid UTF-8: opened as Windows-1252; Encoding > Reopen can change this.");
         }
         Ok(())
@@ -1964,6 +2147,21 @@ impl App {
 
     fn close_document(&mut self) -> Result<()> {
         let index = self.index();
+        let id = self.documents[index].snapshot.id;
+        if self.groups[1 - self.focused].contains(&id) {
+            self.clear_compare();
+            self.groups[self.focused].retain(|entry| *entry != id);
+            self.normalize_groups();
+            self.refresh_views()?;
+            self.update_tabs();
+            self.update_status();
+            self.editor().focus();
+            self.touch();
+            if self.tree_visible {
+                self.schedule_json();
+            }
+            return Ok(());
+        }
         if self.document_dirty(index) {
             match message(
                 Some(&self.window),
@@ -1993,6 +2191,9 @@ impl App {
             self.new_document()?;
         }
         let closed = self.documents.remove(index);
+        for group in &mut self.groups {
+            group.retain(|id| *id != closed.snapshot.id);
+        }
         if self
             .results
             .data
@@ -2015,6 +2216,7 @@ impl App {
                 Some(if i > index { i - 1 } else { i })
             }
         });
+        self.normalize_groups();
         if self.secondary.is_none() {
             self.focused = 0;
             self.editors[1].attach(&self.documents[self.primary].handle);
@@ -2067,6 +2269,14 @@ impl App {
                 .filter_map(|l| l.custom.as_deref().cloned())
                 .collect(),
             completion_api: self.completion_api.clone(),
+            pane_documents: self.groups.clone().map(|group| {
+                group
+                    .into_iter()
+                    .filter_map(|id| document_position(&self.documents, id))
+                    .collect()
+            }),
+            pane_selected: [self.primary, self.secondary.unwrap_or(0)],
+            focused_pane: self.focused,
         })
     }
 
@@ -2842,7 +3052,18 @@ impl App {
             return Err("Open two documents in separate tabs to compare.".into());
         }
         let left = self.index();
-        self.begin_compare(left, (left + 1) % self.documents.len(), None)
+        if let Some(right) = self.secondary.filter(|right| *right != self.primary) {
+            self.begin_compare(self.primary, right, None)
+        } else {
+            let group = &self.groups[self.focused];
+            let position = group
+                .iter()
+                .position(|id| *id == self.documents[left].snapshot.id)
+                .ok_or("The current document is outside the focused pane.")?;
+            let right = document_position(&self.documents, group[(position + 1) % group.len()])
+                .ok_or("The next tab is no longer open.")?;
+            self.begin_compare(left, right, None)
+        }
     }
 
     fn begin_compare(
@@ -2856,9 +3077,20 @@ impl App {
         }
         self.compare_options.validate()?;
         self.clear_compare();
+        let left_id = self.documents[left].snapshot.id;
+        let right_id = self.documents[right].snapshot.id;
+        self.groups[1].retain(|id| *id != left_id);
+        self.groups[0].retain(|id| *id != right_id);
+        if !self.groups[0].contains(&left_id) {
+            self.groups[0].push(left_id);
+        }
+        if !self.groups[1].contains(&right_id) {
+            self.groups[1].push(right_id);
+        }
         self.primary = left;
         self.focused = 0;
         self.secondary = Some(right);
+        self.normalize_groups();
         self.compare_pair = Some([
             self.documents[left].snapshot.id,
             self.documents[right].snapshot.id,
@@ -3606,6 +3838,7 @@ impl App {
             TAB_PIN => self.pin_tab(self.documents[self.index()].snapshot.id),
             TAB_LEFT | TAB_RIGHT => {
                 self.event(Event::StepTab(
+                    self.focused,
                     self.documents[self.index()].snapshot.id,
                     command == TAB_LEFT,
                 ))?;
@@ -3643,18 +3876,28 @@ impl App {
             REPLACE | REPLACE_ALL => self.replace(command == REPLACE_ALL)?,
             SPLIT => {
                 self.clear_compare();
-                self.secondary = if self.secondary.is_some() {
-                    None
-                } else {
-                    Some(self.primary)
-                };
-                if self.secondary.is_none() {
+                if self.secondary.is_some() {
+                    for id in std::mem::take(&mut self.groups[1]) {
+                        if !self.groups[0].contains(&id) {
+                            self.groups[0].push(id);
+                        }
+                    }
+                    self.primary = self.index();
+                    self.secondary = None;
                     self.focused = 0;
+                } else {
+                    let id = self.documents[self.index()].snapshot.id;
+                    self.transfer_tab(id, self.groups[self.focused].len() == 1)?;
                 }
+                self.normalize_groups();
                 self.refresh_views()?;
                 self.update_tabs();
-                self.note("Click a pane, then a tab, to choose its document. F6 switches panes.");
+                self.editor().focus();
+                self.touch();
+                self.note("Each pane has its own tabs. Open in split moves a tab; Clone explicitly shares it. F6 switches panes.");
             }
+            TAB_SPLIT => self.split_tab(self.documents[self.index()].snapshot.id)?,
+            TAB_CLONE => self.transfer_tab(self.documents[self.index()].snapshot.id, true)?,
             MAP => {
                 self.map_visible = !self.map_visible;
                 self.configure_map();
@@ -4020,27 +4263,42 @@ impl App {
                     self.apply_theme();
                 }
             }
-            Event::MoveTab(id, requested) => self.move_tab(id, requested)?,
+            Event::MoveTab(pane, id, requested) => self.move_tab(pane, id, requested)?,
             Event::PinTab(id) => self.pin_tab(id),
-            Event::SplitTab(id) => self.split_tab(id)?,
+            Event::SplitTab(pane, id) | Event::CloneTab(pane, id) => {
+                let clone = matches!(event, Event::CloneTab(_, _));
+                if pane > 1 || !self.groups[pane].contains(&id) {
+                    return Err("This tab is no longer open in the source pane.".into());
+                }
+                self.focus_pane(pane);
+                self.transfer_tab(id, clone)?;
+            }
             Event::CompareTabs(current, target) => self.compare_tabs(current, target)?,
-            Event::StepTab(id, previous) => {
-                if let Some(index) = self.documents.iter().position(|doc| doc.snapshot.id == id) {
+            Event::StepTab(pane, id, previous) => {
+                if let Some(index) = self.groups[pane].iter().position(|entry| *entry == id) {
                     let requested = if previous {
                         index.saturating_sub(1)
                     } else {
-                        (index + 1).min(self.documents.len() - 1)
+                        (index + 1).min(self.groups[pane].len() - 1)
                     };
-                    self.move_tab(id, requested)?;
+                    self.move_tab(pane, id, requested)?;
                 }
             }
-            Event::Tab(id) | Event::CloseTab(id) => {
+            Event::NewInPane(pane) => {
+                if pane > 1 || (pane == 1 && self.secondary.is_none()) {
+                    return Ok(());
+                }
+                self.focus_pane(pane);
+                self.new_document()?;
+            }
+            Event::Tab(pane, id) | Event::CloseTab(pane, id) => {
+                if pane > 1 || !self.groups[pane].contains(&id) {
+                    return Ok(());
+                }
+                self.focus_pane(pane);
                 if let Some(index) = self.documents.iter().position(|d| d.snapshot.id == id) {
-                    let close = matches!(event, Event::CloseTab(_));
-                    if !close && index == self.index() {
-                        return Ok(());
-                    }
-                    if self.comparing {
+                    let close = matches!(event, Event::CloseTab(_, _));
+                    if self.comparing && (close || index != self.index()) {
                         self.clear_compare();
                     }
                     self.switch(index)?;
@@ -4050,22 +4308,24 @@ impl App {
                 }
             }
             Event::NextTab(previous) => {
-                let len = self.documents.len();
+                let group = &self.groups[self.focused];
+                let len = group.len();
+                let position = group
+                    .iter()
+                    .position(|id| *id == self.documents[self.index()].snapshot.id)
+                    .ok_or("The active document is outside its pane.")?;
+                let id = group[(position + if previous { len - 1 } else { 1 }) % len];
+                let index = document_position(&self.documents, id)
+                    .ok_or("The next tab is no longer open.")?;
                 if self.comparing {
                     self.clear_compare();
                 }
-                self.switch((self.index() + if previous { len - 1 } else { 1 }) % len)?;
+                self.switch(index)?;
             }
             Event::OtherPane => {
                 if self.secondary.is_some() {
-                    self.focused = 1 - self.focused;
+                    self.focus_pane(1 - self.focused);
                     self.editor().focus();
-                    self.configure_map();
-                    self.update_tabs();
-                    self.update_status();
-                    if self.tree_visible {
-                        self.schedule_json();
-                    }
                 }
             }
             Event::Escape => {
@@ -4080,17 +4340,11 @@ impl App {
                 }
             }
             Event::Focus(pane, id) => {
-                if self.pane_ids[pane].get() == id && (pane == 0 || self.secondary.is_some()) {
-                    let changed = self.focused != pane;
-                    self.focused = pane;
-                    if changed {
-                        self.configure_map();
-                        self.update_tabs();
-                        self.update_status();
-                        if self.tree_visible {
-                            self.schedule_json();
-                        }
-                    }
+                if self.pane_ids[pane].get() == id
+                    && (pane == 0 || self.secondary.is_some())
+                    && self.editors[pane].widget().has_focus()
+                {
+                    self.focus_pane(pane);
                 }
             }
             Event::Updated(pane, id) => {
@@ -4418,6 +4672,14 @@ pub fn run() -> Result<()> {
     app.apply_theme();
     app.layout();
     app.editor().focus();
+    if let Some(warning) = app.startup_warning.take() {
+        message(
+            Some(&app.window),
+            &warning,
+            gtk::MessageType::Warning,
+            &[("_Close", gtk::ResponseType::Close)],
+        );
+    }
     let window = app.window.clone();
     let app = Rc::new(RefCell::new(app));
     let state = app.clone();

@@ -196,13 +196,50 @@ fn native_editing_unicode_split_selection_highlighting_and_undo() {
             assert_eq!(left.send(SCI_STYLEGETSIZEFRACTIONAL, style, 0), 1250);
         }
         let large = EditorFont::new("Monospace", 3200).unwrap();
+        left.set_text("line numbers\n").unwrap();
         left.theme_with_font(rust, Palette::new(false), &large);
-        let digits = CString::new("9999").unwrap();
-        let number_width = left.send_raw(SCI_TEXTWIDTH, 33, digits.as_ptr() as isize);
-        assert!(
-            left.send(SCI_GETMARGINWIDTHN, 0, 0) >= number_width + 12,
-            "Line numbers must fit the selected font size"
+        let two_digits = left.send_raw(SCI_TEXTWIDTH, 33, c"99".as_ptr() as isize);
+        assert_eq!(
+            left.send(SCI_GETMARGINWIDTHN, 0, 0),
+            two_digits + (two_digits / 2).max(4)
         );
+        left.set_text(&"\n".repeat(98)).unwrap();
+        left.update_line_number_margin();
+        let compact_width = left.send(SCI_GETMARGINWIDTHN, 0, 0);
+        assert_eq!(compact_width, two_digits + (two_digits / 2).max(4));
+        left.set_text(&"\n".repeat(99)).unwrap();
+        left.update_line_number_margin();
+        let three_digits = left.send_raw(SCI_TEXTWIDTH, 33, c"999".as_ptr() as isize);
+        assert_eq!(
+            left.send(SCI_GETMARGINWIDTHN, 0, 0),
+            three_digits + (three_digits / 3).max(4)
+        );
+        assert!(left.send(SCI_GETMARGINWIDTHN, 0, 0) > compact_width);
+        left.set_text(&"\n".repeat(9999)).unwrap();
+        left.update_line_number_margin();
+        let five_digits = left.send_raw(SCI_TEXTWIDTH, 33, c"99999".as_ptr() as isize);
+        assert_eq!(
+            left.send(SCI_GETMARGINWIDTHN, 0, 0),
+            five_digits + (five_digits / 5).max(4)
+        );
+        left.send(SCI_SETZOOM, 4, 0);
+        left.update_line_number_margin();
+        let zoomed_digits = left.send_raw(SCI_TEXTWIDTH, 33, c"99999".as_ptr() as isize);
+        assert!(zoomed_digits > five_digits);
+        assert_eq!(
+            left.send(SCI_GETMARGINWIDTHN, 0, 0),
+            zoomed_digits + (zoomed_digits / 5).max(4)
+        );
+        left.set_text("").unwrap();
+        left.send(SCI_SETZOOM, 0, 0);
+        left.theme_with_font(rust, Palette::new(true), &EditorFont::default());
+        let compact_digits = left.send_raw(SCI_TEXTWIDTH, 33, c"99".as_ptr() as isize);
+        assert_eq!(
+            left.send(SCI_GETMARGINWIDTHN, 0, 0),
+            compact_digits + (compact_digits / 2).max(4)
+        );
+        assert!(left.send(SCI_GETMARGINWIDTHN, 0, 0) < 52);
+        assert_eq!(left.send(SCI_GETMARGINWIDTHN, 2, 0), 16);
         left.theme_with_font(rust, Palette::new(true), &selected_font);
         assert_eq!(style_font(&left, 32), "Sans");
         assert_eq!(left.send(SCI_STYLEGETSIZEFRACTIONAL, 32, 0), 1250);

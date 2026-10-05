@@ -3,10 +3,12 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
 use std::{
+    collections::HashSet,
     fs::{self, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 pub const SESSION_VERSION: u32 = 2;
@@ -238,6 +240,32 @@ pub struct Session {
     pub custom_languages: Vec<crate::udl::UserLanguage>,
     #[serde(default)]
     pub completion_api: Vec<crate::completion::Api>,
+    #[serde(default)]
+    pub pane_documents: [Vec<usize>; 2],
+    #[serde(default)]
+    pub pane_selected: [usize; 2],
+    #[serde(default)]
+    pub focused_pane: usize,
+}
+
+impl Session {
+    fn validate_panes(&self) -> Result<()> {
+        if self.focused_pane > 1 {
+            return Err("Recovery contains an invalid focused pane.".into());
+        }
+        for (pane, group) in self.pane_documents.iter().enumerate() {
+            let mut seen = HashSet::new();
+            if group.len() > self.documents.len()
+                || group
+                    .iter()
+                    .any(|index| *index >= self.documents.len() || !seen.insert(*index))
+                || (!group.is_empty() && !group.contains(&self.pane_selected[pane]))
+            {
+                return Err("Recovery contains an invalid pane tab group or selection.".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 fn monitor_enabled() -> bool {
@@ -287,6 +315,20 @@ fn parent_directory(path: &Path) -> Result<&Path> {
 #[cfg(target_os = "linux")]
 fn same_linux_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(target_os = "linux")]
+fn unchanged_linux_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    same_linux_file(left, right)
+        && left.uid() == right.uid()
+        && left.gid() == right.gid()
+        && left.mode() == right.mode()
+        && left.nlink() == right.nlink()
+        && left.size() == right.size()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
 }
 
 #[cfg(target_os = "linux")]
@@ -352,17 +394,7 @@ fn linux_verify_destination(
     let (current_path, current) = linux_save_destination(path, follow_symlinks)?;
     let unchanged = match (previous, current.as_ref()) {
         (None, None) => true,
-        (Some(before), Some(after)) => {
-            same_linux_file(before, after)
-                && before.uid() == after.uid()
-                && before.gid() == after.gid()
-                && before.mode() == after.mode()
-                && before.size() == after.size()
-                && before.mtime() == after.mtime()
-                && before.mtime_nsec() == after.mtime_nsec()
-                && before.ctime() == after.ctime()
-                && before.ctime_nsec() == after.ctime_nsec()
-        }
+        (Some(before), Some(after)) => unchanged_linux_file(before, after),
         _ => false,
     };
     if current_path != destination || !unchanged {
@@ -535,21 +567,19 @@ fn atomic_write_impl(path: &Path, bytes: &[u8], explicit_save: bool) -> Result<(
     result.map_err(|e| format!("Could not save {}: {e}", path.display()))
 }
 
-pub fn load(path: &Path) -> Result<Session> {
-    let exists = match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            #[cfg(target_os = "linux")]
-            if metadata.is_symlink() {
-                return Err(
-                    "Recovery files must not be symlinks; the linked file has not been changed."
-                        .into(),
-                );
-            }
-            #[cfg(not(target_os = "linux"))]
-            let _ = metadata;
-            true
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+fn empty_session() -> Session {
+    Session {
+        version: SESSION_VERSION,
+        theme: "system".into(),
+        monitor_files: true,
+        ..Session::default()
+    }
+}
+
+fn read_recovery(path: &Path) -> Result<Option<(Vec<u8>, fs::Metadata)>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(format!(
                 "Could not inspect recovery file {}: {error}",
@@ -557,16 +587,57 @@ pub fn load(path: &Path) -> Result<Session> {
             ));
         }
     };
-    if !exists {
-        return Ok(Session {
-            version: SESSION_VERSION,
-            theme: "system".into(),
-            monitor_files: true,
-            ..Session::default()
-        });
+    if !metadata.is_file() {
+        return Err("Recovery must be a regular file, not a symlink or another file type.".into());
     }
-    let bytes = read_bounded(path, MAX_RECOVERY_BYTES)?;
-    let session: Session = serde_json::from_slice(&bytes)
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1 {
+            return Err(
+                "Recovery must be owned by the current user and have a single link.".into(),
+            );
+        }
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("Could not read recovery: {error}"))?;
+    #[cfg(target_os = "linux")]
+    if !unchanged_linux_file(
+        &metadata,
+        &file.metadata().map_err(|error| error.to_string())?,
+    ) {
+        return Err("Recovery changed while opening it; it has not been moved or replaced.".into());
+    }
+    let mut bytes = Vec::new();
+    (&file)
+        .take(MAX_RECOVERY_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Could not read recovery: {error}"))?;
+    if bytes.len() > MAX_RECOVERY_BYTES {
+        return Err("Recovery exceeds the 512 MiB size limit; it has not been moved.".into());
+    }
+    #[cfg(target_os = "linux")]
+    if !unchanged_linux_file(
+        &metadata,
+        &file.metadata().map_err(|error| error.to_string())?,
+    ) {
+        return Err("Recovery changed while reading it; it has not been moved or replaced.".into());
+    }
+    Ok(Some((bytes, metadata)))
+}
+
+pub fn load(path: &Path) -> Result<Session> {
+    match read_recovery(path)? {
+        Some((bytes, _)) => parse(&bytes),
+        None => Ok(empty_session()),
+    }
+}
+
+fn parse(bytes: &[u8]) -> Result<Session> {
+    let session: Session = serde_json::from_slice(bytes)
         .map_err(|e| format!("Recovery file is invalid; it has not been changed: {e}"))?;
     if !matches!(session.version, 1 | SESSION_VERSION) {
         return Err("Unsupported recovery version; the file has not been changed.".into());
@@ -582,6 +653,7 @@ pub fn load(path: &Path) -> Result<Session> {
     if session.custom_languages.len() > 64 || session.completion_api.len() > 10_000 {
         return Err("Recovery language/completion definitions exceed their limits.".into());
     }
+    session.validate_panes()?;
     session.compare_options.validate()?;
     for language in &session.custom_languages {
         language.validate()?;
@@ -598,6 +670,101 @@ pub fn load(path: &Path) -> Result<Session> {
         }
     }
     Ok(session)
+}
+
+/// Moves only readable, invalid recovery aside, without changing its contents.
+/// Filesystem/ownership/read failures still stop startup instead of hiding them.
+pub fn load_or_quarantine(path: &Path) -> Result<(Session, Option<String>)> {
+    let Some((bytes, metadata)) = read_recovery(path)? else {
+        return Ok((empty_session(), None));
+    };
+    match parse(&bytes) {
+        Ok(session) => Ok((session, None)),
+        Err(error) => {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            let moved = quarantine(path, &metadata, stamp)
+                .map_err(|move_error| format!("{error}\n\n{move_error}"))?;
+            Ok((
+                empty_session(),
+                Some(format!(
+                    "The recovery file could not be used and was moved, unchanged, to:\n{}\n\nrstpd started with an empty session.\n\nDetails: {error}",
+                    moved.display()
+                )),
+            ))
+        }
+    }
+}
+
+fn quarantine(path: &Path, previous: &fs::Metadata, stamp: u64) -> Result<PathBuf> {
+    let parent = parent_directory(path)?;
+    #[cfg(target_os = "linux")]
+    let directory = {
+        let metadata = fs::symlink_metadata(parent).map_err(|error| error.to_string())?;
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(
+                "Recovery quarantine requires a user-owned directory not writable by other users."
+                    .into(),
+            );
+        }
+        let directory = fs::File::open(parent).map_err(|error| error.to_string())?;
+        if !same_linux_file(
+            &metadata,
+            &directory.metadata().map_err(|error| error.to_string())?,
+        ) {
+            return Err("Recovery directory changed while opening it.".into());
+        }
+        directory
+    };
+    let stem = path.file_stem().map_or_else(
+        || "session".into(),
+        |stem| stem.to_string_lossy().into_owned(),
+    );
+    for attempt in 0..100u32 {
+        let name = if attempt == 0 {
+            format!("{stem}.invalid-{stamp}.json")
+        } else {
+            format!("{stem}.invalid-{stamp}-{attempt}.json")
+        };
+        let target = parent.join(name);
+        #[cfg(target_os = "linux")]
+        {
+            let current = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+            if !current.is_file() || !unchanged_linux_file(previous, &current) {
+                return Err("Recovery changed before quarantine; it has not been moved.".into());
+            }
+            match linux_publish_new_file(path, &target) {
+                Ok(()) => {
+                    directory.sync_all().map_err(|error| {
+                        format!(
+                            "Recovery was moved to {}, but directory flush failed: {error}",
+                            target.display()
+                        )
+                    })?;
+                    return Ok(target);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "Could not move invalid recovery aside without overwriting: {error}"
+                    ));
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = previous;
+            if !target.try_exists().map_err(|error| error.to_string())? {
+                fs::rename(path, &target).map_err(|error| error.to_string())?;
+                return Ok(target);
+            }
+        }
+    }
+    Err("Could not choose a name for the invalid recovery file.".into())
 }
 
 pub fn save(path: &Path, session: &Session) -> Result<()> {
@@ -669,6 +836,45 @@ impl Drop for RecoveryWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quarantine_never_overwrites_an_earlier_copy() {
+        let directory = std::env::temp_dir().join(format!(
+            "rstpd-quarantine-{}-{}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("session.json");
+        let earlier = directory.join("session.invalid-42.json");
+        fs::write(&path, b"new").unwrap();
+        fs::write(&earlier, b"old").unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let moved = quarantine(&path, &metadata, 42).unwrap();
+        assert_eq!(moved, directory.join("session.invalid-42-1.json"));
+        assert_eq!(fs::read(&earlier).unwrap(), b"old");
+        assert_eq!(fs::read(&moved).unwrap(), b"new");
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn changed_recovery_is_not_quarantined_using_an_older_snapshot() {
+        let directory = std::env::temp_dir().join(format!(
+            "rstpd-quarantine-race-{}-{}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("session.json");
+        fs::write(&path, b"old").unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        fs::write(&path, b"new longer snapshot").unwrap();
+        assert!(quarantine(&path, &metadata, 42).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"new longer snapshot");
+        assert!(!directory.join("session.invalid-42.json").exists());
+        fs::remove_dir_all(&directory).unwrap();
+    }
     #[test]
     fn renamed_app_preserves_legacy_recovery_and_lock_locations() {
         let root = std::env::temp_dir().join(format!(
