@@ -61,11 +61,11 @@ impl Drop for Running {
 }
 
 fn forward(directory: &Path, working_directory: &Path, paths: &[&str]) {
-    let mut launch = Running(
-        command(directory, working_directory, paths)
-            .spawn()
-            .unwrap(),
-    );
+    finish_launch(command(directory, working_directory, paths));
+}
+
+fn finish_launch(mut command: Command) {
+    let mut launch = Running(command.spawn().unwrap());
     let mut status = None;
     wait(|| {
         status = launch.0.try_wait().unwrap();
@@ -156,4 +156,30 @@ fn open_with_reuses_the_matching_instance_and_preserves_unsaved_documents() {
     assert_eq!(fs::read_to_string(first).unwrap(), "original\n");
     drop(other);
     drop(app);
+
+    let state_root = directory.join("xdg-state");
+    let default_state = state_root.join("rstpd-gtk");
+    let default_command = |paths: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rstpd"));
+        command
+            .current_dir(&directory)
+            .env("XDG_STATE_HOME", &state_root)
+            .args(paths);
+        command
+    };
+    let default_app = Running(default_command(&["first.txt"]).spawn().unwrap());
+    wait(|| default_state.join("session.lock").exists());
+    rstpd::instance::forward(&default_state, &Request::default()).unwrap();
+    finish_launch(default_command(&["file with spaces-\u{65e5}.txt"]));
+    wait(|| {
+        session::load(&default_state.join("session.json"))
+            .is_ok_and(|saved| saved.documents.len() == 2)
+    });
+    let default_session = session::load(&default_state.join("session.json")).unwrap();
+    assert_eq!(
+        default_session.documents.len(),
+        2,
+        "Open with without --session-dir must reuse the default workspace"
+    );
+    drop(default_app);
 }
