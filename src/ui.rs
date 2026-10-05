@@ -252,6 +252,11 @@ fn message(
     kind: gtk::MessageType,
     buttons: &[(&str, gtk::ResponseType)],
 ) -> gtk::ResponseType {
+    #[cfg(test)]
+    assert!(
+        tests::consume_expected_message(),
+        "Unexpected native dialog: {text}"
+    );
     let dialog = gtk::MessageDialog::new(
         parent,
         gtk::DialogFlags::MODAL,
@@ -1089,7 +1094,7 @@ impl App {
                 app.secondary = original_ids
                     .get(session.pane_selected[1])
                     .and_then(|id| document_position(&app.documents, *id));
-                app.focused = session.focused_pane;
+                app.focused = session.focused_pane.min(1);
             } else {
                 app.primary = document_position(&app.documents, active).unwrap_or(0);
                 app.secondary = None;

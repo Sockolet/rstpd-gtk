@@ -115,17 +115,19 @@ fn pane_groups_clones_selections_and_focus_round_trip_with_legacy_defaults() {
 }
 
 #[test]
-fn invalid_pane_metadata_is_quarantined_without_changing_original_bytes() {
+fn invalid_recovery_is_quarantined_without_changing_original_bytes() {
     let workspace = Workspace::new();
     let path = workspace.0.join("session.json");
-    for (field, value) in [
-        ("pane_documents", serde_json::json!([[0, 0], [1]])),
-        ("pane_documents", serde_json::json!([[999], [1]])),
-        ("pane_selected", serde_json::json!([1, 2])),
-        ("focused_pane", serde_json::json!(2)),
-    ] {
-        let mut invalid = serde_json::to_value(pane_session()).unwrap();
-        invalid[field] = value;
+    let baseline = serde_json::to_value(pane_session()).unwrap();
+    let mut unsupported = baseline.clone();
+    unsupported["version"] = 99.into();
+    let mut too_many = baseline.clone();
+    too_many["documents"] = serde_json::Value::Array(vec![baseline["documents"][0].clone(); 257]);
+    let mut bad_regex = baseline.clone();
+    bad_regex["compare_options"]["ignore_regex"] = "[".into();
+    let mut bad_font = baseline;
+    bad_font["editor_font"]["size_hundredths"] = 0.into();
+    for invalid in [unsupported, too_many, bad_regex, bad_font] {
         let bytes = serde_json::to_vec(&invalid).unwrap();
         fs::write(&path, &bytes).unwrap();
         assert!(session::load(&path).is_err());

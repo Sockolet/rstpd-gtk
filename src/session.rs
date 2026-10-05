@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
 use std::{
-    collections::HashSet,
     fs::{self, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -246,26 +245,6 @@ pub struct Session {
     pub pane_selected: [usize; 2],
     #[serde(default)]
     pub focused_pane: usize,
-}
-
-impl Session {
-    fn validate_panes(&self) -> Result<()> {
-        if self.focused_pane > 1 {
-            return Err("Recovery contains an invalid focused pane.".into());
-        }
-        for (pane, group) in self.pane_documents.iter().enumerate() {
-            let mut seen = HashSet::new();
-            if group.len() > self.documents.len()
-                || group
-                    .iter()
-                    .any(|index| *index >= self.documents.len() || !seen.insert(*index))
-                || (!group.is_empty() && !group.contains(&self.pane_selected[pane]))
-            {
-                return Err("Recovery contains an invalid pane tab group or selection.".into());
-            }
-        }
-        Ok(())
-    }
 }
 
 fn monitor_enabled() -> bool {
@@ -653,7 +632,6 @@ fn parse(bytes: &[u8]) -> Result<Session> {
     if session.custom_languages.len() > 64 || session.completion_api.len() > 10_000 {
         return Err("Recovery language/completion definitions exceed their limits.".into());
     }
-    session.validate_panes()?;
     session.compare_options.validate()?;
     for language in &session.custom_languages {
         language.validate()?;

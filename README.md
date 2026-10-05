@@ -114,9 +114,10 @@ document in both panes when it is the group's only tab. Toggling an existing
 split off merges both groups without discarding documents or duplicating clones.
 Pinned-first ordering applies independently to each group. Recovery stores the
 groups, tab order, selections and focused pane. Older recovery without this
-metadata opens all documents in the left group. Invalid group indices, repeated
-tabs within one group and invalid selections are rejected as invalid recovery;
-one document can still appear in both groups.
+metadata opens all documents in the left group. Unusable pane references or
+selections are repaired without dropping documents: invalid/duplicate references
+are removed and unassigned documents return to the left group. One document can
+still appear in both groups as a clone.
 
 **Compare with current view** compares
 the document active before the right-click against the clicked tab, not the

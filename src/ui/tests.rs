@@ -1,5 +1,17 @@
 use super::*;
 
+thread_local! {
+    static EXPECTED_MESSAGES: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(super) fn consume_expected_message() -> bool {
+    EXPECTED_MESSAGES.with(|count| {
+        let remaining = count.get();
+        count.set(remaining.saturating_sub(1));
+        remaining > 0
+    })
+}
+
 struct DirectoryCleanup(PathBuf);
 
 impl Drop for DirectoryCleanup {
@@ -475,6 +487,13 @@ fn with_message_response(
     response: gtk::ResponseType,
     action: impl FnOnce(&mut App),
 ) {
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            EXPECTED_MESSAGES.with(|count| count.set(self.0));
+        }
+    }
+    let _restore = Restore(EXPECTED_MESSAGES.with(|count| count.replace(1)));
     let observed = Rc::new(Cell::new(false));
     let capture = observed.clone();
     let existing = gtk::Window::list_toplevels();
@@ -1568,6 +1587,52 @@ fn exercise_pane_group_parity_and_recovery(directory: &Path) {
     assert!(app.groups[1].is_empty());
     assert!(app.secondary.is_none());
     assert_eq!(app.focused, 0);
+    app.close().unwrap();
+    drop(app);
+    EVENTS.with(|events| events.borrow_mut().clear());
+
+    let damaged_state = directory.join("pane-damaged-state");
+    fs::create_dir(&damaged_state).unwrap();
+    let mut damaged = serde_json::to_value(&saved).unwrap();
+    damaged["pane_documents"] = serde_json::json!([[999, 0, 0], [1, 1, 999]]);
+    damaged["pane_selected"] = serde_json::json!([2, 999]);
+    damaged["focused_pane"] = 9000.into();
+    fs::write(
+        damaged_state.join("session.json"),
+        serde_json::to_vec(&damaged).unwrap(),
+    )
+    .unwrap();
+    let mut app = App::new(&damaged_state).unwrap();
+    app.window.show_all();
+    app.layout();
+    app.editor().focus();
+    pump(&mut app);
+    assert!(
+        app.startup_warning.is_none(),
+        "Repairable layout metadata must not quarantine valid documents"
+    );
+    assert_eq!(app.documents.len(), saved.documents.len());
+    let represented: HashSet<_> = app.groups.iter().flatten().copied().collect();
+    assert_eq!(represented.len(), saved.documents.len());
+    for group in &app.groups {
+        assert_eq!(
+            group.len(),
+            group.iter().copied().collect::<HashSet<_>>().len()
+        );
+    }
+    assert_eq!(
+        app.snapshot()
+            .unwrap()
+            .documents
+            .iter()
+            .map(|doc| &doc.text)
+            .collect::<Vec<_>>(),
+        saved
+            .documents
+            .iter()
+            .map(|doc| &doc.text)
+            .collect::<Vec<_>>()
+    );
     app.close().unwrap();
     drop(app);
     EVENTS.with(|events| events.borrow_mut().clear());
