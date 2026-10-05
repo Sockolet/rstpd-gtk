@@ -258,12 +258,14 @@ mod tests {
         assert!(Request::decode(&bytes).is_ok());
         bytes.push(b' ');
         assert!(Request::decode(&bytes).is_err());
-        let request = Request::new(
-            vec![PathBuf::from("a".repeat(MAX_REQUEST_BYTES))],
-            vec![],
-            vec![],
-        )
-        .unwrap();
+        let request = Request {
+            paths: vec![
+                std::env::current_dir()
+                    .unwrap()
+                    .join("a".repeat(MAX_REQUEST_BYTES)),
+            ],
+            ..Default::default()
+        };
         assert!(request.encode().is_err());
     }
 
