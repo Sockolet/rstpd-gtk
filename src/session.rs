@@ -97,7 +97,13 @@ fn create_private_directories(directory: &Path) -> Result<()> {
 /// takes a nonblocking exclusive lock. Keep the returned guard for the whole session.
 #[cfg(target_os = "linux")]
 pub fn lock_directory(directory: &Path) -> Result<SessionLock> {
-    let operation = || -> Result<SessionLock> {
+    try_lock_directory(directory)?
+        .ok_or_else(|| format!("Could not lock {}: Another rstpd-gtk session is already using this recovery directory.", directory.display()))
+}
+
+#[cfg(target_os = "linux")]
+pub fn try_lock_directory(directory: &Path) -> Result<Option<SessionLock>> {
+    let operation = || -> Result<Option<SessionLock>> {
         create_private_directories(directory)?;
         let metadata = fs::symlink_metadata(directory).map_err(|error| error.to_string())?;
         if !metadata.is_dir() {
@@ -156,9 +162,7 @@ pub fn lock_directory(directory: &Path) -> Result<SessionLock> {
         match file.try_lock() {
             Ok(()) => {}
             Err(fs::TryLockError::WouldBlock) => {
-                return Err(
-                    "Another rstpd-gtk session is already using this recovery directory.".into(),
-                );
+                return Ok(None);
             }
             Err(fs::TryLockError::Error(error)) => {
                 return Err(format!("Could not acquire the session lock: {error}"));
@@ -176,7 +180,7 @@ pub fn lock_directory(directory: &Path) -> Result<SessionLock> {
         parent
             .sync_all()
             .map_err(|error| format!("Could not flush the recovery directory: {error}"))?;
-        Ok(SessionLock { _file: file })
+        Ok(Some(SessionLock { _file: file }))
     };
     operation().map_err(|error| format!("Could not lock {}: {error}", directory.display()))
 }

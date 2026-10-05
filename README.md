@@ -29,7 +29,7 @@ application code or plugin code is included.
 Download the Linux x86_64 archive and its SHA-256 checksum from
 [Releases](https://github.com/Sockolet/rstpd-gtk/releases/latest), or build from
 source using the instructions below. Verify the archive with
-`sha256sum -c rstpd-1.3.0-linux-x86_64.tar.gz.sha256`, extract it, and run
+`sha256sum -c rstpd-1.3.1-linux-x86_64.tar.gz.sha256`, extract it, and run
 `./rstpd` from the extracted directory. GTK3 must be installed on the system;
 the upstream Windows ZIP is not a Linux package.
 
@@ -40,9 +40,14 @@ the upstream Windows ZIP is not a Linux package.
 ```
 
 Use `--session-dir DIRECTORY` for a separate workspace. Only one
-instance may use a session directory at a time. Opening another instance
-does not forward filenames to the existing instance. Local files can also be
-dropped onto the editor. Remote URLs are not opened or downloaded.
+instance may use a session directory at a time. Launching again with the same
+session forwards files and language/completion imports to the running editor,
+then activates its window. Already-open files select their existing tabs without
+replacing unsaved edits. A launch without filenames only activates the window.
+Different session directories still create independent workspaces. Forwarding
+is local to the same Linux user, bounded to 256 filenames and a 64 KiB request.
+Failures are reported, not silently ignored. Local files can also be dropped
+onto the editor. Remote URLs are not opened or downloaded.
 Use `--` before filenames beginning with `-`.
 
 Recovery reads upstream version-1 and version-2 schemas and saves version 2,

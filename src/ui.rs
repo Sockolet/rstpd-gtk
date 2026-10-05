@@ -7,7 +7,9 @@ use crate::{
     },
     editor::{self, DocumentHandle, Editor, Palette, sci::*},
     folder_search::{self, FolderOptions},
+    instance,
     languages::{self, Language},
+    launch::Request as LaunchRequest,
     monitor::{self, Monitor},
     search_results::{self, Input as SearchInput, Link as ResultLink, Results as SearchResults},
     session::{self, DocumentSnapshot, RecoveryWorker, Session},
@@ -189,6 +191,7 @@ thread_local! {
 }
 
 enum Event {
+    Launch(LaunchRequest),
     Command(usize),
     Close,
     Theme,
@@ -691,8 +694,13 @@ struct App {
 }
 
 impl App {
+    #[cfg(test)]
     fn new(directory: &Path) -> Result<Self> {
         let lock = session::lock_directory(directory)?;
+        Self::new_with_lock(directory, lock)
+    }
+
+    fn new_with_lock(directory: &Path, lock: session::SessionLock) -> Result<Self> {
         let recovery_path = directory.join("session.json");
         let session = session::load(&recovery_path)?;
         let settings = gtk::Settings::default().ok_or("GTK settings are unavailable.")?;
@@ -3980,6 +3988,30 @@ impl App {
 
     fn event(&mut self, event: Event) -> Result<()> {
         match event {
+            Event::Launch(request) => {
+                self.window.deiconify();
+                self.window.present();
+                let mut failures = Vec::new();
+                for path in request.language_paths {
+                    if let Err(error) = self.import_language(&path) {
+                        failures.push(error);
+                    }
+                }
+                for path in request.paths {
+                    if let Err(error) = self.open_path(&path, None) {
+                        failures.push(error);
+                    }
+                }
+                for path in request.api_paths {
+                    if let Err(error) = self.import_api(&path) {
+                        failures.push(error);
+                    }
+                }
+                self.editor().focus();
+                if !failures.is_empty() {
+                    return Err(failures.join("\n"));
+                }
+            }
             Event::Command(command) => self.command(command)?,
             Event::Close => self.close()?,
             Event::Error(error) => return Err(error),
@@ -4359,7 +4391,15 @@ pub fn run() -> Result<()> {
         Some(path) => path,
         None => session::linux_default_directory()?,
     };
-    let mut app = App::new(&directory)?;
+    let lock = match session::try_lock_directory(&directory)? {
+        Some(lock) => lock,
+        None => {
+            let request = LaunchRequest::new(paths, language_paths, api_paths)?;
+            instance::forward(&directory, &request)?;
+            return Ok(());
+        }
+    };
+    let mut app = App::new_with_lock(&directory, lock)?;
     for path in language_paths {
         app.import_language(&path)?;
     }
@@ -4382,7 +4422,14 @@ pub fn run() -> Result<()> {
     let app = Rc::new(RefCell::new(app));
     let state = app.clone();
     let mut last_tick = Instant::now();
+    let mut server = instance::Server::new(&directory)?;
     let timer = glib::timeout_add_local(Duration::from_millis(16), move || {
+        for request in server.poll() {
+            queue(match request {
+                Ok(request) => Event::Launch(request),
+                Err(error) => Event::Error(error),
+            });
+        }
         for _ in 0..512 {
             let Some(event) = EVENTS.with(|events| events.borrow_mut().pop_front()) else {
                 break;
