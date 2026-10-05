@@ -1559,7 +1559,14 @@ fn exercise_pane_group_parity_and_recovery(directory: &Path) {
         .iter()
         .position(|encoding| *encoding == Encoding::Utf16Le)
         .unwrap();
-    app.command(REOPEN_BASE + encoding).unwrap();
+    with_message_response(&mut app, gtk::ResponseType::Cancel, |app| {
+        app.command(REOPEN_BASE + encoding).unwrap();
+    });
+    assert_eq!(app.documents[app.index()].snapshot.encoding, Encoding::Utf8);
+    assert_eq!(app.editor().text().unwrap(), "a\0b\0c\0");
+    with_message_response(&mut app, gtk::ResponseType::Yes, |app| {
+        app.command(REOPEN_BASE + encoding).unwrap();
+    });
     assert_eq!(app.editor().text().unwrap(), "abc");
     assert_eq!(fs::read(&bomless).unwrap(), b"a\0b\0c\0");
     app.close().unwrap();
