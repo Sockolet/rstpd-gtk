@@ -1674,6 +1674,132 @@ fn exercise_pane_group_parity_and_recovery(directory: &Path) {
     EVENTS.with(|events| events.borrow_mut().clear());
 }
 
+fn visible_tab_bounds(app: &App, pane: usize) -> Vec<(usize, i32, i32)> {
+    let notebook = &app.tabs[pane];
+    (0..notebook.n_pages())
+        .filter_map(|position| {
+            let page = notebook.nth_page(Some(position))?;
+            let tab = notebook.tab_label(&page)?;
+            if !tab.is_drawable() {
+                return None;
+            }
+            let (x, _) = tab.translate_coordinates(notebook, 0, 0)?;
+            let right = x + tab.allocated_width();
+            (x >= 0 && right <= notebook.allocated_width() && right > x).then_some((
+                position as usize,
+                x,
+                right,
+            ))
+        })
+        .collect()
+}
+
+fn assert_tab_overflow(app: &mut App, pane: usize, selected: usize) -> Vec<(usize, i32, i32)> {
+    wait_for(app, |app| {
+        let visible = visible_tab_bounds(app, pane);
+        visible.len() >= 2 && visible.last().is_some_and(|tab| tab.0 == selected)
+    });
+    let visible = visible_tab_bounds(app, pane);
+    assert_eq!(app.tabs[pane].current_page(), Some(selected as u32));
+    for adjacent in visible.windows(2) {
+        assert_eq!(
+            adjacent[0].0 + 1,
+            adjacent[1].0,
+            "Overflow tabs must remain consecutive"
+        );
+        assert!(
+            adjacent[0].2 <= adjacent[1].1,
+            "Tab headers must not overlap"
+        );
+    }
+    let first_page = app.tabs[pane].nth_page(Some(visible[0].0 as u32)).unwrap();
+    let first = app.tabs[pane].tab_label(&first_page).unwrap();
+    let preceding_space = visible[0].1;
+    assert!(
+        preceding_space < first.allocated_width(),
+        "Unused space must not hide a whole preceding tab"
+    );
+    visible
+}
+
+fn exercise_dynamic_tab_overflow(directory: &Path) {
+    let state = directory.join("tab-overflow-state");
+    let mut app = App::new(&state).unwrap();
+    app.new_document().unwrap();
+    app.window.show_all();
+    app.window.resize(1100, 700);
+    app.layout();
+    app.editor().focus();
+    pump(&mut app);
+    let original_header = app.tabs[0].nth_page(Some(0)).unwrap();
+    for _ in 0..18 {
+        app.new_document().unwrap();
+        pump(&mut app);
+    }
+    assert_eq!(
+        app.tabs[0].nth_page(Some(0)).unwrap(),
+        original_header,
+        "Adding/selecting tabs must preserve native page widgets and their viewport"
+    );
+    let order = app.groups.clone();
+    let initial = assert_tab_overflow(&mut app, 0, 18);
+    app.editor().replace(0..0, "edited newest").unwrap();
+    pump(&mut app);
+    assert_eq!(
+        visible_tab_bounds(&app, 0),
+        initial,
+        "Dirty labels must not reset tab scrolling"
+    );
+    for theme in [THEME_DARK, THEME_LIGHT] {
+        app.command(theme).unwrap();
+        pump(&mut app);
+        assert_tab_overflow(&mut app, 0, 18);
+    }
+    app.window.resize(800, 600);
+    pump(&mut app);
+    let narrow = assert_tab_overflow(&mut app, 0, 18);
+    app.window.resize(1500, 800);
+    wait_for(&mut app, |app| app.window.allocated_width() >= 1400);
+    let wide = assert_tab_overflow(&mut app, 0, 18);
+    assert!(
+        wide.len() > narrow.len(),
+        "Widening must reveal more preceding tabs"
+    );
+    assert_eq!(app.groups, order, "Viewport changes must not reorder tabs");
+    app.event(Event::NextTab(true)).unwrap();
+    pump(&mut app);
+    assert_eq!(app.tabs[0].current_page(), Some(17));
+    assert!(visible_tab_bounds(&app, 0).iter().any(|tab| tab.0 == 17));
+    app.event(Event::NextTab(false)).unwrap();
+    assert_tab_overflow(&mut app, 0, 18);
+    app.command(TAB_PIN).unwrap();
+    pump(&mut app);
+    assert_eq!(app.groups[0][0], order[0][18]);
+    app.command(TAB_PIN).unwrap();
+    app.event(Event::MoveTab(0, order[0][18], 18)).unwrap();
+    pump(&mut app);
+    assert_tab_overflow(&mut app, 0, 18);
+
+    app.command(SPLIT).unwrap();
+    for _ in 0..8 {
+        app.new_document().unwrap();
+        pump(&mut app);
+    }
+    assert_tab_overflow(&mut app, 1, 8);
+    let right_view = visible_tab_bounds(&app, 1);
+    app.focus_pane(0);
+    app.event(Event::NextTab(true)).unwrap();
+    assert_tab_overflow(&mut app, 0, 17);
+    assert_eq!(
+        visible_tab_bounds(&app, 1),
+        right_view,
+        "Each pane keeps its own viewport"
+    );
+    app.close().unwrap();
+    drop(app);
+    EVENTS.with(|events| events.borrow_mut().clear());
+}
+
 #[test]
 fn gtk_workflows_preserve_editing_features_and_recovery() {
     gtk::init().expect("Run GUI tests in a desktop session or with xvfb-run");
@@ -2212,4 +2338,5 @@ fn gtk_workflows_preserve_editing_features_and_recovery() {
     drop(app);
     EVENTS.with(|events| events.borrow_mut().clear());
     exercise_pane_group_parity_and_recovery(&directory);
+    exercise_dynamic_tab_overflow(&directory);
 }

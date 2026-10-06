@@ -20,7 +20,7 @@ use crate::{
 use gtk::{gdk, gio, glib, prelude::*};
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     rc::Rc,
@@ -608,6 +608,12 @@ struct Document {
     last_edit: Instant,
 }
 
+struct TabHeader {
+    page: gtk::Box,
+    label: gtk::Label,
+    pinned: Rc<Cell<bool>>,
+}
+
 fn document_position(documents: &[Document], id: u64) -> Option<usize> {
     documents.iter().position(|doc| doc.snapshot.id == id)
 }
@@ -643,6 +649,8 @@ struct App {
     window: gtk::Window,
     menu: gtk::MenuBar,
     tabs: [gtk::Notebook; 2],
+    tab_pages: [RefCell<HashMap<u64, TabHeader>>; 2],
+    tab_current: Rc<Cell<u64>>,
     tab_width: [Rc<Cell<i32>>; 2],
     groups: [Vec<u64>; 2],
     status: gtk::Label,
@@ -994,6 +1002,8 @@ impl App {
             window,
             menu,
             tabs,
+            tab_pages: Default::default(),
+            tab_current: Rc::new(Cell::new(0)),
             tab_width,
             groups: Default::default(),
             status,
@@ -1832,11 +1842,21 @@ impl App {
 
     fn update_tabs(&self) {
         TABS_UPDATING.with(|flag| flag.set(true));
+        if let Some(doc) = self.documents.get(self.index()) {
+            self.tab_current.set(doc.snapshot.id);
+        }
         for (pane, notebook) in self.tabs.iter().enumerate() {
-            while notebook.n_pages() > 0 {
-                notebook.remove_page(Some(0));
-            }
-            for id in &self.groups[pane] {
+            let mut headers = self.tab_pages[pane].borrow_mut();
+            headers.retain(|id, header| {
+                if self.groups[pane].contains(id) {
+                    return true;
+                }
+                if let Some(position) = notebook.page_num(&header.page) {
+                    notebook.remove_page(Some(position));
+                }
+                false
+            });
+            for (position, id) in self.groups[pane].iter().enumerate() {
                 let Some(index) = document_position(&self.documents, *id) else {
                     continue;
                 };
@@ -1847,6 +1867,14 @@ impl App {
                     doc.snapshot.title,
                     if doc.snapshot.dirty { " *" } else { "" }
                 );
+                if let Some(header) = headers.get(id) {
+                    header.label.set_text(&title);
+                    header.pinned.set(doc.snapshot.pinned);
+                    if notebook.page_num(&header.page) != Some(position as u32) {
+                        notebook.reorder_child(&header.page, Some(position as u32));
+                    }
+                    continue;
+                }
                 let label = gtk::Label::new(Some(&title));
                 label.set_ellipsize(gtk::pango::EllipsizeMode::End);
                 label.set_width_chars(20);
@@ -1865,8 +1893,9 @@ impl App {
                 let tab = gtk::EventBox::new();
                 tab.set_visible_window(false);
                 tab.add(&row);
-                let pinned = doc.snapshot.pinned;
-                let current = self.documents[self.index()].snapshot.id;
+                let pinned = Rc::new(Cell::new(doc.snapshot.pinned));
+                let header_pinned = pinned.clone();
+                let current = self.tab_current.clone();
                 tab.connect_button_press_event(move |tab, event| {
                     if event.button() != 3 {
                         return glib::Propagation::Proceed;
@@ -1875,13 +1904,14 @@ impl App {
                     menu.set_attach_widget(Some(tab));
                     menu.connect_selection_done(|menu| unsafe { menu.destroy() });
                     for (label, action) in [
-                        (if pinned { "Unpin tab" } else { "Pin tab" }, 0),
+                        (if pinned.get() { "Unpin tab" } else { "Pin tab" }, 0),
                         ("Move tab left", 1),
                         ("Move tab right", 2),
                         ("Open in split view", 3),
                         ("Compare with current view", 4),
                         ("Clone to other pane", 5),
                     ] {
+                        let current = current.get();
                         let item = gtk::MenuItem::with_label(label);
                         item.set_sensitive(action != 4 || current != id);
                         item.connect_activate(move |_| {
@@ -1903,9 +1933,17 @@ impl App {
                 tab.show_all();
                 let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
                 page.set_widget_name(&id.to_string());
-                notebook.append_page(&page, Some(&tab));
+                notebook.insert_page(&page, Some(&tab), Some(position as u32));
                 notebook.set_tab_reorderable(&page, true);
                 page.show();
+                headers.insert(
+                    id,
+                    TabHeader {
+                        page,
+                        label,
+                        pinned: header_pinned,
+                    },
+                );
             }
             let selected = if pane == 0 {
                 Some(self.primary)

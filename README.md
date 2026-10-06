@@ -29,7 +29,7 @@ application code or plugin code is included.
 Download the Linux x86_64 archive and its SHA-256 checksum from
 [Releases](https://github.com/Sockolet/rstpd-gtk/releases/latest), or build from
 source using the instructions below. Verify the archive with
-`sha256sum -c rstpd-1.4.0-linux-x86_64.tar.gz.sha256`, extract it, and run
+`sha256sum -c rstpd-1.4.1-linux-x86_64.tar.gz.sha256`, extract it, and run
 `./rstpd` from the extracted directory. GTK3 must be installed on the system;
 the upstream Windows ZIP is not a Linux package.
 
@@ -101,6 +101,12 @@ also use Ctrl+Shift+PageUp/PageDown. Pinned tabs form a left-hand group; neither
 dragging nor the movement commands can cross its boundary. Pinning does not
 make a document read-only. Order and pins persist in workspace recovery.
 Double-click the empty area after the last tab to create an untitled document.
+When tabs overflow, opening a new tab keeps it at the right of the visible
+strip with as many consecutive preceding tabs as fit to its left, rather than
+showing the newest tab alone. Resizing refills the strip, and each pane scrolls
+independently. Tab order/pins remain unchanged and native overflow arrows still
+reach hidden tabs. Updating dirty labels or pane focus retains existing native
+tab pages instead of resetting their scroll position.
 
 The tab context menu also provides **Open in split view**, which moves the
 right-clicked tab to the other pane, reusing an existing split.
@@ -491,6 +497,9 @@ rectangular editing, undo, and visible Markdown styles in both palettes.
 Pane regressions cover independent tab bars, focused-group navigation,
 move/clone/close behavior, shared undo, split-aware comparison, persisted layout,
 legacy recovery, quarantine startup and explicit reopening of BOM-less UTF-16.
+Overflow regressions check real mapped tab rectangles, newest-tab visibility,
+retained page widgets, adjacent tabs, resizing, dirty labels, keyboard navigation,
+pin/reorder and independent split-pane scroll positions.
 `tests/parity_contract.rs` runs the same portable completion, encoding-hint,
 pane-layout and recovery-quarantine contracts as the Windows sibling.
 They also cover persisted symbol preferences, Unicode/selection character
