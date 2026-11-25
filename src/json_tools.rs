@@ -20,6 +20,14 @@ struct Token {
     span: Range<usize>,
 }
 
+fn is_json5_space(ch: char) -> bool {
+    ch.is_whitespace() || ch == '\u{feff}'
+}
+
+fn is_json5_line_terminator(ch: char) -> bool {
+    matches!(ch, '\r' | '\n' | '\u{2028}' | '\u{2029}')
+}
+
 fn tokens(text: &str) -> Result<Vec<Token>> {
     if text.len() > MAX_TOOL_BYTES {
         return Err("JSON tools are limited to 16 MiB.".into());
@@ -30,7 +38,7 @@ fn tokens(text: &str) -> Result<Vec<Token>> {
     while pos < text.len() {
         let start = pos;
         let ch = text[pos..].chars().next().unwrap();
-        if ch.is_whitespace() || ch == '\u{feff}' {
+        if is_json5_space(ch) {
             pos += ch.len_utf8();
             continue;
         }
@@ -78,8 +86,12 @@ fn tokens(text: &str) -> Result<Vec<Token>> {
             }
             '/' if text[pos..].starts_with("//") => {
                 pos += 2;
-                while pos < text.len() && !b"\r\n".contains(&text.as_bytes()[pos]) {
-                    pos += 1;
+                while pos < text.len() {
+                    let next = text[pos..].chars().next().unwrap();
+                    if is_json5_line_terminator(next) {
+                        break;
+                    }
+                    pos += next.len_utf8();
                 }
                 Kind::LineComment
             }
@@ -94,7 +106,7 @@ fn tokens(text: &str) -> Result<Vec<Token>> {
                 pos += ch.len_utf8();
                 while pos < text.len() {
                     let next = text[pos..].chars().next().unwrap();
-                    if next.is_whitespace()
+                    if is_json5_space(next)
                         || "{}[],:".contains(next)
                         || text[pos..].starts_with("//")
                         || text[pos..].starts_with("/*")
@@ -296,5 +308,13 @@ mod tests {
         assert_eq!(format(&text, true).unwrap(), text);
         let comments = "{x:1,// keep\n y:2}";
         assert!(validate(&format(comments, true).unwrap()).is_ok());
+    }
+    #[test]
+    fn json5_line_separators_and_bom_whitespace_are_tokenized_accurately() {
+        let text = "// lead\u{2028}{a\u{feff}: 123456789012345678901234567890\u{feff}, // mid\u{2029}b: 2}";
+        let formatted = format(text, false).unwrap();
+        assert!(formatted.contains("123456789012345678901234567890"));
+        assert!(formatted.contains("b: 2"));
+        assert!(validate(&formatted).unwrap());
     }
 }

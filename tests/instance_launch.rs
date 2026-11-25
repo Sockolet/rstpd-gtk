@@ -128,6 +128,12 @@ fn open_with_reuses_the_matching_instance_and_preserves_unsaved_documents() {
     let other = Running::start(&other_state, &directory, &["third.txt"]);
     assert!(session::try_lock_directory(&state).unwrap().is_none());
     forward(&state.join("."), &directory, &["first.txt"]);
+    // A peer disconnecting mid-frame must not freeze the running editor behind a modal dialog.
+    {
+        use std::{io::Write, os::unix::net::UnixStream};
+        let mut broken = UnixStream::connect(state.join("ipc/instance.sock")).unwrap();
+        broken.write_all(&[8, 0, 0, 0, b'{']).unwrap();
+    }
     forward(
         &state,
         &directory,

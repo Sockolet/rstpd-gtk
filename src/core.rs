@@ -597,8 +597,17 @@ fn expand_bounded(
     while !rest.is_empty() {
         let end = if rest.starts_with("$$") {
             2
-        } else if rest.starts_with("${") {
-            rest.find('}').map(|i| i + 1).unwrap_or(1)
+        } else if let Some(after) = rest.strip_prefix("${") {
+            let name_len = after
+                .as_bytes()
+                .iter()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || **ch == b'_')
+                .count();
+            if name_len > 0 && after.as_bytes().get(name_len) == Some(&b'}') {
+                2 + name_len + 1
+            } else {
+                1
+            }
         } else if rest.starts_with('$') {
             1 + rest.as_bytes()[1..]
                 .iter()
@@ -1166,7 +1175,7 @@ pub fn json_tree(text: &str) -> Result<Vec<JsonNode>> {
                 }
                 if self.json5 && self.text[self.pos..].starts_with("//") {
                     self.pos += self.text[self.pos..]
-                        .find(['\r', '\n'])
+                        .find(['\r', '\n', '\u{2028}', '\u{2029}'])
                         .unwrap_or(self.text.len() - self.pos);
                 } else if self.json5 && self.text[self.pos..].starts_with("/*") {
                     self.pos += self.text[self.pos + 2..]
@@ -1238,8 +1247,7 @@ pub fn json_tree(text: &str) -> Result<Vec<JsonNode>> {
                                     && !self.text[self.pos..]
                                         .chars()
                                         .next()
-                                        .unwrap()
-                                        .is_whitespace()
+                                        .is_some_and(|c| c.is_whitespace() || c == '\u{feff}')
                                     && !self.text[self.pos..].starts_with("/*")
                                     && !self.text[self.pos..].starts_with("//")
                                 {
@@ -1289,10 +1297,9 @@ pub fn json_tree(text: &str) -> Result<Vec<JsonNode>> {
                 }
                 _ => {
                     while self.pos < self.text.len()
-                        && self.text[self.pos..]
-                            .chars()
-                            .next()
-                            .is_some_and(|ch| !",}]".contains(ch) && !ch.is_whitespace())
+                        && self.text[self.pos..].chars().next().is_some_and(|ch| {
+                            !",}]".contains(ch) && !ch.is_whitespace() && ch != '\u{feff}'
+                        })
                         && !self.text[self.pos..].starts_with("//")
                         && !self.text[self.pos..].starts_with("/*")
                     {
@@ -1546,6 +1553,21 @@ mod tests {
         }
         assert_eq!(expand_bounded(&captures, "$1$1", 10).unwrap(), "hellohello");
         assert!(expand_bounded(&captures, "$1$1", 9).is_err());
+        let malformed = format!("${{{}}}", "$0".repeat(100));
+        assert!(expand_bounded(&captures, &malformed, 32).is_err());
+        let mut expected = String::new();
+        captures.expand("${a$1}", &mut expected);
+        assert_eq!(expand_bounded(&captures, "${a$1}", 1024).unwrap(), expected);
+    }
+
+    #[test]
+    fn json_tree_handles_json5_line_separators_and_bom_whitespace() {
+        let text = "// comment\u{2028}{a\u{feff}: 1\u{feff}, // c2\u{2029}b: 2}";
+        let nodes = json_tree(text).unwrap();
+        let a = nodes.iter().find(|n| n.pointer == "/a").unwrap();
+        assert_eq!(&text[a.span.clone()], "1");
+        let b = nodes.iter().find(|n| n.pointer == "/b").unwrap();
+        assert_eq!(&text[b.span.clone()], "2");
     }
 
     #[test]

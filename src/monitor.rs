@@ -83,7 +83,7 @@ impl Scanner {
                     _ => {}
                 }
             }
-            let result = (|| -> Result<Snapshot> {
+            let raw = (|| -> Result<(Vec<u8>, u64)> {
                 let before = current.as_ref().map_err(Clone::clone)?;
                 let bytes = session::read_bounded(&request.path, MAX_DOCUMENT_BYTES)?;
                 if stamp(&request.path)? != *before {
@@ -93,16 +93,44 @@ impl Scanner {
                     ));
                 }
                 let hash = session::fingerprint(&bytes);
-                let unicode_bom = bytes.starts_with(b"\xef\xbb\xbf")
+                Ok((bytes, hash))
+            })();
+            if let Ok((_, hash)) = &raw {
+                let unchanged = Some(*hash) == request.known_hash
+                    || self.files.get(&request.id).is_some_and(|old| {
+                        old.path == request.path
+                            && old.baseline == request.known_hash
+                            && old.hash == Some(*hash)
+                            && old.error.is_none()
+                    });
+                if unchanged {
+                    self.files.insert(
+                        request.id,
+                        Observed {
+                            path: request.path,
+                            baseline: request.known_hash,
+                            stamp: current.ok(),
+                            hash: Some(*hash),
+                            error: None,
+                            checked: Instant::now(),
+                        },
+                    );
+                    continue;
+                }
+            }
+            let result = raw.and_then(|(bytes, hash)| {
+                let unicode_bom = bytes.starts_with(b"\xff\xfe\0\0")
+                    || bytes.starts_with(b"\0\0\xfe\xff")
+                    || bytes.starts_with(b"\xef\xbb\xbf")
                     || bytes.starts_with(b"\xff\xfe")
-                    || bytes.starts_with(b"\xfe\xff")
-                    || bytes.starts_with(b"\0\0\xfe\xff");
-                let override_encoding =
-                    if unicode_bom || !matches!(request.encoding, Encoding::Legacy(_)) {
-                        None
-                    } else {
-                        Some(&request.encoding)
-                    };
+                    || bytes.starts_with(b"\xfe\xff");
+                let override_encoding = if unicode_bom
+                    || matches!(request.encoding, Encoding::Utf8 | Encoding::Utf8Bom)
+                {
+                    None
+                } else {
+                    Some(&request.encoding)
+                };
                 let (text, encoding) = core::decode(&bytes, override_encoding)?;
                 let eol = Eol::detect(&text);
                 Ok(Snapshot {
@@ -111,7 +139,7 @@ impl Scanner {
                     encoding,
                     eol,
                 })
-            })();
+            });
             let (hash, error) = match &result {
                 Ok(snapshot) => (Some(snapshot.hash), None),
                 Err(error) => (None, Some(error.clone())),
@@ -305,6 +333,45 @@ mod tests {
             1
         );
         drop(monitor);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn preserves_bomless_utf16_encoding_and_skips_decoding_unchanged_hashes() {
+        let path = std::env::temp_dir().join(format!(
+            "rstpd-monitor-utf16-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let initial = b"a\0b\0";
+        let updated = b"x\0y\0z\0";
+        fs::write(&path, initial).unwrap();
+        let initial_hash = session::fingerprint(initial);
+        let mut scanner = Scanner::default();
+        assert!(
+            scanner
+                .scan(vec![Request {
+                    id: 1,
+                    path: path.clone(),
+                    known_hash: Some(initial_hash),
+                    encoding: Encoding::Utf16Le,
+                }])
+                .is_empty()
+        );
+        fs::write(&path, updated).unwrap();
+        let changes = scanner.scan(vec![Request {
+            id: 1,
+            path: path.clone(),
+            known_hash: Some(initial_hash),
+            encoding: Encoding::Utf16Le,
+        }]);
+        assert_eq!(changes.len(), 1);
+        let snapshot = changes.into_iter().next().unwrap().result.unwrap();
+        assert_eq!(snapshot.text, "xyz");
+        assert_eq!(snapshot.encoding, Encoding::Utf16Le);
         fs::remove_file(path).unwrap();
     }
 }

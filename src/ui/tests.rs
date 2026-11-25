@@ -2339,4 +2339,79 @@ fn gtk_workflows_preserve_editing_features_and_recovery() {
     EVENTS.with(|events| events.borrow_mut().clear());
     exercise_pane_group_parity_and_recovery(&directory);
     exercise_dynamic_tab_overflow(&directory);
+    exercise_review_regressions(&directory);
+}
+
+fn exercise_review_regressions(directory: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = directory.join("review-regressions");
+    fs::create_dir(&state).unwrap();
+    let mut app = App::new(&state).unwrap();
+    app.new_document().unwrap();
+    app.window.show_all();
+    app.layout();
+    pump(&mut app);
+
+    // 1. Reopen resets snapshot.caret to 0 alongside Scintilla's caret.
+    let reopen_path = directory.join("reopen-caret.txt");
+    fs::write(&reopen_path, "abcdef").unwrap();
+    app.open_path(&reopen_path, None).unwrap();
+    app.editor().send(SCI_GOTOPOS, 5, 0);
+    pump(&mut app);
+    assert_eq!(app.documents[app.index()].snapshot.caret, 5);
+    let utf8 = core::encoding_options()
+        .iter()
+        .position(|e| *e == Encoding::Utf8)
+        .unwrap();
+    with_message_response(&mut app, gtk::ResponseType::Yes, |app| {
+        app.command(REOPEN_BASE + utf8).unwrap();
+    });
+    assert_eq!(app.documents[app.index()].snapshot.caret, 0);
+
+    // 2. JSON_TREE stays synchronized with layout even on oversized documents.
+    app.new_document().unwrap();
+    text(&mut app, &"x".repeat(core::MAX_TOOL_BYTES + 1));
+    assert!(!app.tree_visible);
+    app.command(JSON_TREE).unwrap();
+    assert!(app.tree_visible);
+    assert!(app.tree_scroll.is_visible());
+    assert!(app.note.contains("JSON paused"));
+    app.command(JSON_TREE).unwrap();
+    assert!(!app.tree_visible);
+    assert!(!app.tree_scroll.is_visible());
+
+    // 3. Compare works when the focused pane has one cloned tab and another doc is open in the other pane.
+    app.close_document().unwrap();
+    let doc_a = app.documents[0].snapshot.id;
+    let doc_b = app.documents[1].snapshot.id;
+    app.groups = [vec![doc_a], vec![doc_a, doc_b]];
+    app.primary = 0;
+    app.secondary = Some(0);
+    app.focused = 0;
+    app.refresh_views().unwrap();
+    app.update_tabs();
+    app.command(COMPARE).unwrap();
+    assert!(app.comparing);
+    assert_eq!(app.pane_documents(), (doc_a, Some(doc_b)));
+    app.command(COMPARE_CLEAR).unwrap();
+
+    // 4. Failed quit-time flush + Cancel must clear recovery_busy so autosave resumes.
+    app.recovery_busy = true;
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o500)).unwrap();
+    with_message_response(&mut app, gtk::ResponseType::Cancel, |app| {
+        app.close().unwrap();
+    });
+    assert!(!app.exiting);
+    assert!(!app.recovery_busy);
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    app.touch();
+    app.last_autosave = Instant::now() - Duration::from_secs(5);
+    app.tick().unwrap();
+    wait_for(&mut app, |app| {
+        !app.recovery_busy && app.recovered_revision == app.revision && app.recovery_error.is_none()
+    });
+    app.close().unwrap();
+    drop(app);
+    EVENTS.with(|events| events.borrow_mut().clear());
 }

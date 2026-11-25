@@ -29,7 +29,7 @@ application code or plugin code is included.
 Download the Linux x86_64 archive and its SHA-256 checksum from
 [Releases](https://github.com/Sockolet/rstpd-gtk/releases/latest), or build from
 source using the instructions below. Verify the archive with
-`sha256sum -c rstpd-1.4.1-linux-x86_64.tar.gz.sha256`, extract it, and run
+`sha256sum -c rstpd-1.4.2-linux-x86_64.tar.gz.sha256`, extract it, and run
 `./rstpd` from the extracted directory. GTK3 must be installed on the system;
 the upstream Windows ZIP is not a Linux package.
 
@@ -45,8 +45,10 @@ session forwards files and language/completion imports to the running editor,
 then activates its window. Already-open files select their existing tabs without
 replacing unsaved edits. A launch without filenames only activates the window.
 Different session directories still create independent workspaces. Forwarding
-is local to the same Linux user, bounded to 256 filenames and a 64 KiB request.
-Failures are reported, not silently ignored. Local files can also be dropped
+uses a private (`0700`) Unix domain socket directory inside the session
+directory with peer-credential verification, bounded to 256 filenames and a
+64 KiB request. Rejected peer connections are logged and noted in the status
+bar without blocking the running editor. Local files can also be dropped
 onto the editor. Remote URLs are not opened or downloaded.
 Use `--` before filenames beginning with `-`.
 
@@ -134,8 +136,10 @@ Opening a normal split clears any active comparison.
 
 **View > Automatically reload external changes** is enabled by default and
 saved per workspace. A background worker polls named files about once a second,
-with periodic content checks for same-size/same-timestamp rewrites. Clean
-buffers reload automatically, preserving selection/caret/scroll where possible.
+with periodic hash checks for same-size/same-timestamp rewrites that skip full
+decoding when file bytes are unchanged. Clean buffers reload automatically,
+preserving selection/caret/scroll and explicitly selected encodings (including
+BOM-less UTF-16/UTF-32) where possible.
 Unsaved text or encoding/EOL changes require confirmation. Declining keeps
 the buffer and the existing save-conflict check; the same rejected disk version
 does not repeatedly prompt. Missing/unreadable files are reported, not loaded
@@ -197,7 +201,8 @@ a decimal number; invalid input is reported before any edits are applied.
 
 The JSON tree refreshes after a short typing pause and preserves expanded paths.
 Incomplete or invalid JSON temporarily pauses navigation instead of pointing
-at stale positions. JSON5 formatting keeps comments, quoted/unquoted keys,
+at stale positions. JSON5 formatting keeps comments (including Unicode LS/PS
+line terminators and BOM whitespace), quoted/unquoted keys,
 trailing commas, hex values and original number spellings; it does not convert
 JSON5 into strict JSON. Minification retains comments and required line breaks.
 
@@ -248,7 +253,8 @@ Both kinds of definitions persist in the session.
 ```
 
 The completion API import is associated with the active file's language.
-Parameter hints keep Rust turbofish generic commas separate from call arguments.
+Parameter hints keep Rust turbofish generic commas and function-type/arrow
+tokens (`->`, `=>`) inside parameter lists separate from call arguments.
 Comparisons such as `text == ""` do not override an annotated receiver type.
 
 ## Show symbols
@@ -376,7 +382,8 @@ advisory lock held for the process lifetime. The lock file is deliberately
 retained after exit; an existing lock file alone does not indicate a running app.
 Snapshots run approximately every three seconds after changes; a crash can
 lose edits since the last completed snapshot. Normal exit waits for the final
-snapshot and refuses to exit if that save fails.
+snapshot and refuses to exit if that save fails; cancelling exit after a failed
+flush restores normal background autosave retries.
 
 Closing the app preserves every tab without asking for filenames.
 Closing an individual dirty tab offers Save / Discard / Cancel; **Discard

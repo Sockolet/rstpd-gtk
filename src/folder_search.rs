@@ -184,17 +184,6 @@ pub fn find_in_files(
                     continue;
                 }
             };
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::MetadataExt;
-                if !options.hidden && metadata.file_attributes() & 2 != 0 {
-                    continue;
-                }
-                if metadata.file_attributes() & 0x400 != 0 {
-                    warn(&mut results, &path, "reparse point skipped");
-                    continue;
-                }
-            }
             if metadata.file_type().is_symlink() {
                 warn(&mut results, &path, "symbolic link skipped");
                 continue;

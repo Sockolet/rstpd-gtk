@@ -144,6 +144,7 @@ pub fn try_lock_directory(directory: &Path) -> Result<Option<SessionLock>> {
                 }
                 let file = OpenOptions::new()
                     .write(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                     .open(&path)
                     .map_err(|error| error.to_string())?;
                 if !same_linux_file(
@@ -486,33 +487,7 @@ fn atomic_write_impl(path: &Path, bytes: &[u8], explicit_save: bool) -> Result<(
         }
         file.sync_all().map_err(|e| e.to_string())?;
         drop(file);
-        #[cfg(windows)]
-        {
-            use std::os::windows::ffi::OsStrExt;
-            use windows_sys::Win32::Storage::FileSystem::{
-                MOVEFILE_WRITE_THROUGH, MoveFileExW, ReplaceFileW,
-            };
-            let from: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
-            let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-            let ok = unsafe {
-                if path.exists() {
-                    ReplaceFileW(
-                        to.as_ptr(),
-                        from.as_ptr(),
-                        std::ptr::null(),
-                        0,
-                        std::ptr::null(),
-                        std::ptr::null(),
-                    )
-                } else {
-                    MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH)
-                }
-            };
-            if ok == 0 {
-                return Err(std::io::Error::last_os_error().to_string());
-            }
-        }
-        #[cfg(all(not(windows), not(target_os = "linux")))]
+        #[cfg(not(target_os = "linux"))]
         fs::rename(&tmp, destination).map_err(|e| e.to_string())?;
         #[cfg(target_os = "linux")]
         {

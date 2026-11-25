@@ -482,13 +482,17 @@ pub fn suggestions(
         }
     }
     if let Some(receiver) = receiver {
-        let member = Regex::new(&format!(
-            r"\b{}\s*(?:\.|->|::)\s*([\p{{XID_Start}}_$][\p{{XID_Continue}}$]*)",
-            regex::escape(&receiver)
-        ))
-        .unwrap();
-        for captures in member.captures_iter(&analysis.masked) {
-            add(&captures[1]);
+        if !receiver.is_empty()
+            && receiver.len() <= 256
+            && receiver.chars().any(identifier)
+            && let Ok(member) = Regex::new(&format!(
+                r"\b{}\s*(?:\.|->|::)\s*([\p{{XID_Start}}_$][\p{{XID_Continue}}$]*)",
+                regex::escape(&receiver)
+            ))
+        {
+            for captures in member.captures_iter(&analysis.masked) {
+                add(&captures[1]);
+            }
         }
     } else {
         for word in keywords.iter().flat_map(|set| set.split_whitespace()) {
@@ -566,18 +570,23 @@ pub fn call_tip(text: &str, caret: usize, language: &str, extra: &[Api]) -> Opti
     let end = matching_close(&signature_mask, begin - 1)?;
     let mut spans = Vec::new();
     let mut part = begin;
-    depth = 0;
+    let mut paren_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut prev = '\0';
     for (offset, ch) in signature_mask[begin..end].char_indices() {
         let pos = begin + offset;
         match ch {
-            '(' | '[' | '{' | '<' => depth += 1,
-            ')' | ']' | '}' | '>' => depth -= 1,
-            ',' if depth == 0 => {
+            '(' | '[' | '{' => paren_depth += 1,
+            ')' | ']' | '}' => paren_depth = paren_depth.saturating_sub(1),
+            '<' => angle_depth += 1,
+            '>' if !matches!(prev, '-' | '=') => angle_depth = angle_depth.saturating_sub(1),
+            ',' if paren_depth == 0 && angle_depth == 0 => {
                 spans.push(part..pos);
                 part = pos + 1;
             }
             _ => {}
         }
+        prev = ch;
     }
     spans.push(part..end);
     let parameter = spans
@@ -790,5 +799,28 @@ mod tests {
             let words = suggestions(&text, text.len(), "Rust", &[], &[], false).words;
             assert!(words.contains(&"trim".into()), "{words:?}");
         }
+    }
+
+    #[test]
+    fn oversized_or_empty_receivers_do_not_panic_or_pollute_suggestions() {
+        let long_chain = format!("foo.bar;\n{}.", "a.".repeat(20_000));
+        let words = suggestions(&long_chain, long_chain.len(), "Rust", &[], &[], true).words;
+        assert!(!words.contains(&"bar".into()));
+        let empty_receiver = "foo.bar;\n..";
+        let words = suggestions(empty_receiver, empty_receiver.len(), "Rust", &[], &[], true).words;
+        assert!(!words.contains(&"bar".into()));
+    }
+
+    #[test]
+    fn arrow_tokens_inside_parameter_lists_do_not_break_call_tips() {
+        let rust = "fn apply(f: fn(i32) -> i32, value: usize) {}\napply(cb, ";
+        let tip = call_tip(rust, rust.len(), "Rust", &[]).unwrap();
+        assert_eq!(tip.signature[tip.parameter].trim(), "value: usize");
+        let js_arrow = "const run = (cb = x => 1, count) => count;\nrun(fn, ";
+        let tip = call_tip(js_arrow, js_arrow.len(), "JavaScript", &[]).unwrap();
+        assert_eq!(tip.signature[tip.parameter].trim(), "count");
+        let js_fn = "function run2(cb = () => 1, count) { return count; }\nrun2(fn, ";
+        let tip = call_tip(js_fn, js_fn.len(), "JavaScript", &[]).unwrap();
+        assert_eq!(tip.signature[tip.parameter].trim(), "count");
     }
 }

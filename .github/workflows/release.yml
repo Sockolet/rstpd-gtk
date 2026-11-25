@@ -51,7 +51,7 @@ jobs:
         id: package
         run: |
           set -euo pipefail
-          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')"
           name="rstpd-${version}-linux-x86_64"
           mkdir -p "dist/${name}/share/applications" "dist/${name}/licenses"
           cp target/release/rstpd "dist/${name}/"

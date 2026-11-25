@@ -754,15 +754,8 @@ impl Editor {
         }
         if language.lexer == "json" {
             self.property("lexer.json.escape.sequence", "1");
+            self.property("lexer.json.allow.comments", "0");
         }
-        self.property(
-            "lexer.json.allow.comments",
-            if language.sample.ends_with(".jsonc") {
-                "1"
-            } else {
-                "0"
-            },
-        );
         self.theme_with_font(language, palette, editor_font);
         Ok(())
     }

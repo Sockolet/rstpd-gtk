@@ -127,69 +127,16 @@ pub fn session_key(directory: &Path) -> Result<String> {
     ))
 }
 
-#[cfg(windows)]
-pub fn session_key(directory: &Path) -> Result<String> {
-    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
-        GetFileInformationByHandle,
-    };
-    // Directory identity also matches junctions and differently cased paths.
-    let directory = std::fs::OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(directory)
-        .map_err(|error| format!("Could not identify the recovery directory: {error}"))?;
-    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    if unsafe { GetFileInformationByHandle(directory.as_raw_handle(), &mut information) } == 0 {
-        return Err(format!(
-            "Could not identify the recovery directory: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(format!(
-        "{:08x}{:08x}{:08x}",
-        information.dwVolumeSerialNumber, information.nFileIndexHigh, information.nFileIndexLow
-    ))
-}
-
-#[cfg(windows)]
-fn native_bytes(path: &OsStr) -> Vec<u8> {
-    use std::os::windows::ffi::OsStrExt;
-    path.encode_wide().flat_map(u16::to_le_bytes).collect()
-}
-
 #[cfg(unix)]
 fn native_bytes(path: &OsStr) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
     path.as_bytes().to_vec()
 }
 
-#[cfg(windows)]
-fn native_string(bytes: Vec<u8>) -> Result<OsString> {
-    use std::os::windows::ffi::OsStringExt;
-    if !bytes.len().is_multiple_of(2) {
-        return Err("Invalid UTF-16 launch filename.".into());
-    }
-    let units: Vec<_> = bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect();
-    Ok(OsString::from_wide(&units))
-}
-
 #[cfg(unix)]
 fn native_string(bytes: Vec<u8>) -> Result<OsString> {
     use std::os::unix::ffi::OsStringExt;
     Ok(OsString::from_vec(bytes))
-}
-
-#[cfg(windows)]
-fn has_nul(path: &OsStr) -> bool {
-    use std::os::windows::ffi::OsStrExt;
-    path.encode_wide().any(|unit| unit == 0)
 }
 
 #[cfg(unix)]

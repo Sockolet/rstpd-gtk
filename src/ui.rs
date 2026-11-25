@@ -1078,7 +1078,7 @@ impl App {
         app.make_menu();
         app.apply_theme();
         for snapshot in session.documents {
-            app.add_document(snapshot)?;
+            app.push_document(snapshot)?;
         }
         if !app.documents.is_empty() {
             let original_ids: Vec<_> = app.documents.iter().map(|doc| doc.snapshot.id).collect();
@@ -1115,6 +1115,8 @@ impl App {
             app.update_tabs();
             app.editor()
                 .send(SCI_GOTOPOS, app.documents[app.index()].snapshot.caret, 0);
+            app.update_status();
+            app.touch();
         }
         if let Some(warning) = app.startup_warning.clone() {
             app.note(warning);
@@ -1545,7 +1547,7 @@ impl App {
         ));
     }
 
-    fn add_document(&mut self, mut snapshot: DocumentSnapshot) -> Result<()> {
+    fn push_document(&mut self, mut snapshot: DocumentSnapshot) -> Result<()> {
         if self.documents.len() >= 256 {
             return Err("At most 256 tabs can be open.".into());
         }
@@ -1559,11 +1561,6 @@ impl App {
         self.scratch.set_text(&snapshot.text)?;
         self.scratch
             .send(SCI_SETEOLMODE, snapshot.eol.scintilla(), 0);
-        self.scratch.language_with_font(
-            &self.languages[language],
-            self.palette,
-            &self.editor_font,
-        )?;
         snapshot.id = self.next_id;
         self.next_id += 1;
         snapshot.text.clear();
@@ -1579,6 +1576,11 @@ impl App {
             styled_revision: None,
             last_edit: Instant::now(),
         });
+        Ok(())
+    }
+
+    fn add_document(&mut self, snapshot: DocumentSnapshot) -> Result<()> {
+        self.push_document(snapshot)?;
         if self.documents.len() == 1 {
             self.refresh_views()?;
         }
@@ -2168,10 +2170,16 @@ impl App {
         };
         if self.documents[index].snapshot.path.as_ref() == Some(&canonical_destination(&path)?) {
             let current = if path.try_exists().map_err(|e| e.to_string())? {
-                Some(session::fingerprint(&session::read_bounded(
-                    &path,
-                    core::MAX_DOCUMENT_BYTES,
-                )?))
+                if fs::metadata(&path).map_err(|e| e.to_string())?.len()
+                    > core::MAX_DOCUMENT_BYTES as u64
+                {
+                    None
+                } else {
+                    Some(session::fingerprint(&session::read_bounded(
+                        &path,
+                        core::MAX_DOCUMENT_BYTES,
+                    )?))
+                }
             } else {
                 None
             };
@@ -2260,6 +2268,7 @@ impl App {
             }
         });
         self.normalize_groups();
+        self.scratch.attach(&self.documents[self.primary].handle);
         if self.secondary.is_none() {
             self.focused = 0;
             self.editors[1].attach(&self.documents[self.primary].handle);
@@ -3099,12 +3108,16 @@ impl App {
             self.begin_compare(self.primary, right, None)
         } else {
             let group = &self.groups[self.focused];
-            let position = group
-                .iter()
-                .position(|id| *id == self.documents[left].snapshot.id)
-                .ok_or("The current document is outside the focused pane.")?;
-            let right = document_position(&self.documents, group[(position + 1) % group.len()])
-                .ok_or("The next tab is no longer open.")?;
+            let right = if group.len() > 1 {
+                let position = group
+                    .iter()
+                    .position(|id| *id == self.documents[left].snapshot.id)
+                    .ok_or("The current document is outside the focused pane.")?;
+                document_position(&self.documents, group[(position + 1) % group.len()])
+                    .ok_or("The next tab is no longer open.")?
+            } else {
+                (left + 1) % self.documents.len()
+            };
             self.begin_compare(left, right, None)
         }
     }
@@ -4030,15 +4043,18 @@ impl App {
             }
             JSON_TREE | JSON_REFRESH => {
                 self.tree_visible = command == JSON_REFRESH || !self.tree_visible;
+                self.layout();
                 if self.tree_visible {
                     self.schedule_json();
                     self.json_due = Some(Instant::now());
-                    self.launch_json()?;
+                    if let Err(error) = self.launch_json() {
+                        self.json_due = None;
+                        self.note(format!("JSON paused: {error}"));
+                    }
                 } else {
                     self.json_due = None;
                     self.json_rx = None;
                 }
-                self.layout();
             }
             EOL_CRLF | EOL_LF | EOL_CR => {
                 let eol = match command {
@@ -4099,10 +4115,12 @@ impl App {
                     doc.snapshot.eol = Eol::detect(&text);
                     doc.snapshot.disk_hash = Some(session::fingerprint(&bytes));
                     doc.snapshot.dirty = false;
+                    doc.snapshot.caret = 0;
                     doc.base_dirty = false;
                     doc.metadata_dirty = false;
                     doc.revision += 1;
                     doc.styled_revision = None;
+                    doc.last_edit = Instant::now();
                     self.invalidate_tools(self.documents[index].snapshot.id);
                     self.touch();
                     self.refresh_views()?;
@@ -4197,11 +4215,18 @@ impl App {
                             && self.languages[doc.language].uses_container()
                             && self.languages[doc.language].name == result.language
                     }) {
-                        self.documents[index].styled_revision = Some(result.revision);
                         self.scratch.attach(&self.documents[index].handle);
                         match result.result {
-                            Ok(highlight) => self.scratch.highlight(&highlight)?,
+                            Ok(highlight) => {
+                                if highlight.styles.len() != self.scratch.length() {
+                                    self.documents[index].styled_revision = None;
+                                } else {
+                                    self.scratch.highlight(&highlight)?;
+                                    self.documents[index].styled_revision = Some(result.revision);
+                                }
+                            }
                             Err(error) => {
+                                self.documents[index].styled_revision = Some(result.revision);
                                 self.scratch.clear_styles();
                                 self.note(format!("Highlighting paused: {error}"));
                             }
@@ -4232,9 +4257,18 @@ impl App {
         // The flush blocks on a full recovery write; leave the reason on the status bar
         // so the dialog below (which pumps the main loop) renders it if anything fails.
         self.note("Saving recovery before exit...");
-        let saved = self
-            .snapshot()
-            .and_then(|snapshot| self.recovery.flush(self.revision + 1, snapshot));
+        let saved = match self.snapshot() {
+            Ok(snapshot) => {
+                let result = self.recovery.flush(self.revision + 1, snapshot);
+                self.recovery_busy = false;
+                if result.is_ok() {
+                    self.recovered_revision = self.revision;
+                    self.recovery_error = None;
+                }
+                result
+            }
+            Err(error) => Err(error),
+        };
         if let Err(error) = saved {
             self.recovery_error = Some(error.clone());
             self.update_status();
@@ -4696,6 +4730,7 @@ pub fn run() -> Result<()> {
             return Ok(());
         }
     };
+    let mut server = instance::Server::new(&directory)?;
     let mut app = App::new_with_lock(&directory, lock)?;
     for path in language_paths {
         app.import_language(&path)?;
@@ -4727,13 +4762,17 @@ pub fn run() -> Result<()> {
     let app = Rc::new(RefCell::new(app));
     let state = app.clone();
     let mut last_tick = Instant::now();
-    let mut server = instance::Server::new(&directory)?;
     let timer = glib::timeout_add_local(Duration::from_millis(16), move || {
         for request in server.poll() {
-            queue(match request {
-                Ok(request) => Event::Launch(request),
-                Err(error) => Event::Error(error),
-            });
+            match request {
+                Ok(request) => queue(Event::Launch(request)),
+                Err(error) => {
+                    eprintln!("rstpd: {error}");
+                    state
+                        .borrow_mut()
+                        .note(format!("File launch rejected: {error}"));
+                }
+            }
         }
         for _ in 0..512 {
             let Some(event) = EVENTS.with(|events| events.borrow_mut().pop_front()) else {
