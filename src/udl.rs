@@ -213,8 +213,8 @@ pub fn import(xml: &str) -> Result<Vec<UserLanguage>> {
             fold_comments: boolean(attr("allowFoldOfComments"))?,
             fold_compact: boolean(attr("foldCompact"))?,
         };
-        for index in 0..8 {
-            language.prefix[index] =
+        for (index, prefix) in language.prefix.iter_mut().enumerate() {
+            *prefix =
                 boolean(pref.and_then(|p| p.attribute(format!("Keywords{}", index + 1).as_str())))?;
         }
         let lists: HashMap<_, _> = node
@@ -233,8 +233,8 @@ pub fn import(xml: &str) -> Result<Vec<UserLanguage>> {
                     .unwrap_or(""),
             )?;
         }
-        for index in 0..2 {
-            language.operators[index] = words(
+        for (index, group) in language.operators.iter_mut().enumerate() {
+            *group = words(
                 lists
                     .get(format!("Operators{}", index + 1).as_str())
                     .copied()
